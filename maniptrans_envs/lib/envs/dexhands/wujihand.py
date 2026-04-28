@@ -112,12 +112,14 @@ class WujiHand(DexHand, ABC):
         assert len(self.dex2hand_mapping.keys()) == len(self.body_names)
 
         # Bodies that are expected to contact objects (fingertips)
+        # Note: in v5 URDF, the tip geometry is baked into finger*_link4, and
+        # finger*_tip_link has no visual/collision — contacts register on link4.
         self.contact_body_names = [
-            "finger1_tip_link",  # thumb
-            "finger2_tip_link",  # index
-            "finger3_tip_link",  # middle
-            "finger4_tip_link",  # ring
-            "finger5_tip_link",  # pinky
+            "finger1_link4",  # thumb
+            "finger2_link4",  # index
+            "finger3_link4",  # middle
+            "finger4_link4",  # ring
+            "finger5_link4",  # pinky
         ]
 
         # Bone links for visualization (connect body indices)
