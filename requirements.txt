@@ -1,7 +1,7 @@
 aiohttp==3.10.5
 avp_stream==1.0
 black==24.8.0
-bps_torch==0.1
+bps_torch @ git+https://github.com/KailinLi/bps_torch.git
 casadi==3.6.6
 chardet==5.2.0
 chumpy==0.70
