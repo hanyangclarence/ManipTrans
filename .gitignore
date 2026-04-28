@@ -190,6 +190,4 @@ make*.py
 runs
 runs/*
 
-maniptrans_envs/assets/wujihand
-maniptrans_envs/assets/wujihand/*
 output_trajectories_mujoco/
