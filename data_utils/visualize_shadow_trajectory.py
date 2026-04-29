@@ -68,45 +68,100 @@ class DexHandTrajectoryVisualizer:
         self.setup_camera()
 
     def load_trajectory_data(self):
-        """Load trajectory data from pickle file"""
-        traj_file = os.path.join(
+        """Load trajectory data from pickle file.
+
+        Supports two formats:
+          (A) Legacy: <input_dir>/<hand_type>_hand_trajectory_<data_idx>.pkl
+              produced by extract_shadow_trajectory.py.
+          (B) Converted: <input_dir>/sequences/<data_idx>.pkl plus
+              <input_dir>/retargeting/<data_idx>.pkl produced by
+              convert_manus_to_maniptrans.py.
+        """
+        converted_demo = os.path.join(
+            self.args.input_dir, "sequences", f"{self.args.data_idx}.pkl"
+        )
+        legacy_path = os.path.join(
             self.args.input_dir,
-            f"{self.args.hand_type}_hand_trajectory_{self.args.data_idx}.pkl"
+            f"{self.args.hand_type}_hand_trajectory_{self.args.data_idx}.pkl",
         )
 
-        if not os.path.exists(traj_file):
+        if os.path.exists(converted_demo):
+            self._load_converted_format(converted_demo)
+        elif os.path.exists(legacy_path):
+            self._load_legacy_format(legacy_path)
+        else:
             raise FileNotFoundError(
-                f"Trajectory file not found: {traj_file}\n"
-                f"Please run the trajectory extraction first."
+                "Trajectory file not found in either format:\n"
+                f"  converted: {converted_demo}\n"
+                f"  legacy:    {legacy_path}"
             )
 
-        print(f"Loading trajectory from: {traj_file}")
-        with open(traj_file, 'rb') as f:
-            self.data = pickle.load(f)
+        # Common fields the rest of the visualizer expects
+        self.num_frames = self.obj_traj["pose_matrices"].shape[0]
+        self.n_dofs = self.hand_traj["dof_positions"].shape[1]
 
-        # Extract trajectories
-        self.obj_traj = self.data['object_trajectory']
-        self.hand_traj = self.data['hand_trajectory']
-        self.mano_ref = self.data['mano_reference']
-        self.metadata = self.data['metadata']
-
-        # Get sequence info
-        self.num_frames = self.obj_traj['pose_matrices'].shape[0]
-        self.n_dofs = self.hand_traj['dof_positions'].shape[1]
-
-        print(f"Loaded trajectory:")
+        print("Loaded trajectory:")
         print(f"  - Frames: {self.num_frames} ({self.num_frames/60:.2f}s at 60 FPS)")
         print(f"  - {self.args.hand_type.capitalize()} Hand DOFs: {self.n_dofs}")
         print(f"  - Hand side: {self.metadata['side']}")
-
-        # Verify coordinate system
-        coord_system = self.metadata.get('coordinate_system', None)
-        if coord_system != 'IsaacGym':
+        coord_system = self.metadata.get("coordinate_system", None)
+        if coord_system != "IsaacGym":
             raise ValueError(
-                f"Expected coordinate_system='IsaacGym', got '{coord_system}'.\n"
-                f"Please re-run extract_shadow_trajectory.py to generate trajectories in IsaacGym coordinates."
+                f"Expected coordinate_system='IsaacGym', got '{coord_system}'."
             )
-        print(f"  - Coordinate system: {coord_system} ✓")
+        print(f"  - Coordinate system: {coord_system}")
+
+    def _load_legacy_format(self, traj_file):
+        print(f"Loading trajectory (legacy format) from: {traj_file}")
+        with open(traj_file, "rb") as f:
+            self.data = pickle.load(f)
+        self.obj_traj = self.data["object_trajectory"]
+        self.hand_traj = self.data["hand_trajectory"]
+        self.mano_ref = self.data["mano_reference"]
+        self.metadata = self.data["metadata"]
+
+    def _load_converted_format(self, demo_path):
+        retarget_path = os.path.join(
+            self.args.input_dir, "retargeting", f"{self.args.data_idx}.pkl"
+        )
+        if not os.path.exists(retarget_path):
+            raise FileNotFoundError(
+                f"Converted demo present but retargeting file is missing:\n"
+                f"  {retarget_path}"
+            )
+        print(f"Loading trajectory (converted format) from:")
+        print(f"  demo:      {demo_path}")
+        print(f"  retarget:  {retarget_path}")
+        with open(demo_path, "rb") as f:
+            demo = pickle.load(f)
+        with open(retarget_path, "rb") as f:
+            retarget = pickle.load(f)
+
+        # convert wrist_rot (T,3,3) -> axis-angle for the rest of the pipeline
+        wrist_rotmat = np.asarray(demo["wrist_rot"])
+        wrist_aa = R.from_matrix(wrist_rotmat).as_rotvec().astype(np.float32)
+
+        self.obj_traj = {
+            "pose_matrices": np.asarray(demo["obj_trajectory"]),
+        }
+        self.hand_traj = {
+            "wrist_positions": np.asarray(demo["wrist_pos"]),
+            "wrist_rotations_aa": wrist_aa,
+            "dof_positions": np.asarray(retarget["opt_dof_pos"]),
+        }
+        self.mano_ref = {
+            "finger_joints": {
+                k: np.asarray(v) for k, v in demo["mano_joints"].items()
+            },
+        }
+        self.metadata = {
+            "obj_urdf_path": demo["obj_urdf_path"],
+            "obj_id": demo.get("obj_id", "object"),
+            "side": demo["side"],
+            "coordinate_system": "IsaacGym",
+            "fps": demo.get("fps", 60),
+        }
+        self.data = demo  # keep for downstream introspection
 
     def setup_simulation(self):
         """Setup IsaacGym simulation parameters"""
@@ -164,7 +219,11 @@ class DexHandTrajectoryVisualizer:
         hand_urdf = os.path.basename(hand_urdf_abs)
 
         asset_options = gymapi.AssetOptions()
-        asset_options.fix_base_link = False
+        # Kinematic playback: pin the hand base so PhysX doesn't integrate
+        # an apparent floating-base velocity from each set_actor_root_state
+        # teleport (same fix as the object). The finger DOFs are still
+        # set every frame via set_dof_state_tensor.
+        asset_options.fix_base_link = True
         asset_options.disable_gravity = True
         asset_options.flip_visual_attachments = False
         asset_options.collapse_fixed_joints = False
@@ -189,13 +248,20 @@ class DexHandTrajectoryVisualizer:
         hand_pose.p = gymapi.Vec3(0, 0, 0.5)
         hand_pose.r = gymapi.Quat(0, 0, 0, 1)
 
+        # collisionFilter=-1 disables all collision contacts for this actor.
+        # We are doing kinematic replay (states overwritten every frame), so
+        # any PhysX contact resolution between hand/object/markers/table
+        # would corrupt the recorded poses with collision impulses, showing
+        # up as the rotation jitter the user observed.
+        NO_COLLISION = -1
+
         self.hand_actor = self.gym.create_actor(
             self.env,
             self.hand_asset,
             hand_pose,
             f"{self.args.hand_type}_hand",
             0,
-            0
+            NO_COLLISION,
         )
 
         # Set DOF properties
@@ -219,7 +285,9 @@ class DexHandTrajectoryVisualizer:
         obj_urdf = os.path.basename(obj_urdf_abs)
 
         obj_asset_options = gymapi.AssetOptions()
-        obj_asset_options.fix_base_link = False
+        # Kinematic playback: pin the object so PhysX does not integrate its
+        # state. set_actor_root_state_tensor still teleports it each frame.
+        obj_asset_options.fix_base_link = True
         obj_asset_options.disable_gravity = True
 
         print(f"Loading object from: {obj_urdf_abs}")
@@ -239,7 +307,7 @@ class DexHandTrajectoryVisualizer:
                 obj_pose,
                 "object",
                 0,
-                0
+                NO_COLLISION,
             )
 
             # Set object color
@@ -262,6 +330,27 @@ class DexHandTrajectoryVisualizer:
 
         # Create MANO joint markers (spheres)
         self.create_mano_markers()
+
+        # Create the training-env table so the rendered scene matches what
+        # ManipTrans actually instantiates. Specs match dexhandmanip_sh.py:
+        #   box 1.0 x 1.6 x 0.03 m, fix-base, center at (-0.1, 0, 0.4),
+        #   so its top face sits at z = 0.415 (the IsaacGym table surface).
+        # Placed last so existing actor indices (0=hand, 1=obj, 2+=markers)
+        # are preserved.
+        table_asset_options = gymapi.AssetOptions()
+        table_asset_options.fix_base_link = True
+        table_asset = self.gym.create_box(self.sim, 1.0, 1.6, 0.03, table_asset_options)
+        table_pose = gymapi.Transform()
+        table_pose.p = gymapi.Vec3(-0.1, 0.0, 0.4)
+        table_pose.r = gymapi.Quat(0, 0, 0, 1)
+        self.table_actor = self.gym.create_actor(
+            self.env, table_asset, table_pose, "table", 0, NO_COLLISION,
+        )
+        self.gym.set_rigid_body_color(
+            self.env, self.table_actor, 0, gymapi.MESH_VISUAL,
+            gymapi.Vec3(0.1, 0.1, 0.1),
+        )
+        print("✓ Table actor added (matches training-env table)")
 
     def create_mano_markers(self):
         """Create sphere markers for MANO finger joints"""
@@ -301,7 +390,7 @@ class DexHandTrajectoryVisualizer:
                 marker_pose,
                 f"mano_marker_{joint_name}",
                 0,
-                0
+                -1,  # NO_COLLISION
             )
 
             # Set color based on finger
@@ -328,9 +417,27 @@ class DexHandTrajectoryVisualizer:
 
         self.camera_handle = self.gym.create_camera_sensor(self.env, camera_props)
 
-        # Set camera position and target
-        cam_pos = gymapi.Vec3(0.8, 0.8, 0.8)
-        cam_target = gymapi.Vec3(0.0, 0.0, 0.5)
+        # Auto-frame the camera around the trajectory's mean position so the
+        # action is in view regardless of where the demo's table-frame lands.
+        wrist_xyz = np.asarray(self.hand_traj["wrist_positions"])
+        obj_xyz = np.asarray(self.obj_traj["pose_matrices"])[:, :3, 3]
+        scene_center = 0.5 * (wrist_xyz.mean(axis=0) + obj_xyz.mean(axis=0))
+
+        if self.args.camera_view == "side":
+            # Horizontal view, eye-level with the table top. Useful for
+            # eyeballing whether the object actually sits on the table.
+            cam_offset = np.array([0.6, 0.6, 0.0])
+            cam_target_xyz = scene_center.copy()
+            cam_target_xyz[2] = 0.415  # look at table top
+            cam_pos_xyz = scene_center + cam_offset
+            cam_pos_xyz[2] = 0.42  # ~5 mm above table top
+        else:  # "iso"
+            cam_offset = np.array([0.55, 0.55, 0.35])
+            cam_target_xyz = scene_center
+            cam_pos_xyz = scene_center + cam_offset
+
+        cam_pos = gymapi.Vec3(*cam_pos_xyz.tolist())
+        cam_target = gymapi.Vec3(*cam_target_xyz.tolist())
         self.gym.set_camera_location(self.camera_handle, self.env, cam_pos, cam_target)
 
         print(f"\nCamera setup: {self.args.width}x{self.args.height}")
@@ -344,6 +451,14 @@ class DexHandTrajectoryVisualizer:
         # Wrap as torch tensors
         self.root_tensor = gymtorch.wrap_tensor(_root_state)
         self.dof_tensor = gymtorch.wrap_tensor(_dof_state)
+
+        # Pull the *actual* current poses (set by create_actor) into the
+        # wrapped tensor. Without this the tensor is all zeros, and
+        # apply_states' set_actor_root_state_tensor call would teleport every
+        # actor we don't explicitly update (notably the fixed-base table)
+        # back to (0, 0, 0).
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_dof_state_tensor(self.sim)
 
         print(f"State tensors initialized:")
         print(f"  Root state shape: {self.root_tensor.shape}")
@@ -410,11 +525,13 @@ class DexHandTrajectoryVisualizer:
 
     def render_frame(self, frame_idx):
         """Render a single frame and return the image"""
+        # Optionally pin every step to a single source frame (debug aid).
+        eff = self.args.freeze_frame if self.args.freeze_frame >= 0 else frame_idx
         # Set states for hand, object, and MANO markers
-        self.set_hand_state(frame_idx)
-        self.set_object_state(frame_idx)
-        self.set_mano_markers_state(frame_idx)
-        self.apply_states(frame_idx)
+        self.set_hand_state(eff)
+        self.set_object_state(eff)
+        self.set_mano_markers_state(eff)
+        self.apply_states(eff)
 
         # Step simulation
         self.gym.simulate(self.sim)
@@ -451,6 +568,7 @@ class DexHandTrajectoryVisualizer:
 
         # Setup state tensors
         self.setup_state_tensors()
+
 
         # Render every nth frame to save time/space
         render_every = self.args.render_every
@@ -554,6 +672,16 @@ def main():
                         help="Save individual frames as images")
     parser.add_argument("--save_video", action="store_true", default=True,
                         help="Save as video (requires imageio)")
+    parser.add_argument("--camera_view", type=str, default="iso",
+                        choices=["iso", "side"],
+                        help="Camera angle: 'iso' (default 3/4 view) or "
+                             "'side' (horizontal, eye-level with table top).")
+    parser.add_argument("--freeze_frame", type=int, default=-1,
+                        help="If >=0, force every rendered timestep to use "
+                             "this single source frame's pose. Useful for "
+                             "diagnosing physics-induced jitter (a frozen "
+                             "trajectory should produce a perfectly still "
+                             "video; any motion = physics drift).")
 
     # Device parameters
     parser.add_argument("--compute_device_id", type=int, default=0,
