@@ -106,6 +106,10 @@ class DexHandManipRHEnv(VecTask):
         assert len(self.dataIndices) == 1 or self.rollout_len is None, "rolloutLen only works with one data"
         assert len(self.dataIndices) == 1 or self.rollout_begin is None, "rolloutBegin only works with one data"
 
+        # Manus pipeline: demo carries only 5 fingertip mano_joints. pack_data,
+        # the joints obs and the reward all collapse to those 5 keys.
+        self.use_fingertips_only = self.cfg["env"].get("useFingertipsOnly", False)
+
         # Tensor placeholders
         self._root_state = None  # State of root body        (n_envs, 13)
         self._dof_state = None  # State of all joints       (n_envs, n_dof)
@@ -135,6 +139,7 @@ class DexHandManipRHEnv(VecTask):
             record=record,
             headless=headless,
         )
+        n_target_joints = 5 if self.use_fingertips_only else (self.dexhand.n_bodies - 1)
         TARGET_OBS_DIM = (
             128
             + 5
@@ -146,7 +151,7 @@ class DexHandManipRHEnv(VecTask):
                 + 4
                 + 3
                 + 3
-                + (self.dexhand.n_bodies - 1) * 9
+                + n_target_joints * 9
                 + 3
                 + 3
                 + 3
@@ -507,6 +512,22 @@ class DexHandManipRHEnv(VecTask):
         CONTACT_HISTORY_LEN = 3
         self.tips_contact_history = torch.ones(self.num_envs, CONTACT_HISTORY_LEN, 5, device=self.device).bool()
 
+        # Body indices into joints_state[:, 1:] for the 5 fingertips, in
+        # thumb/index/middle/ring/pinky order (must match pack_data).
+        if self.use_fingertips_only:
+            tip_body_indices = [
+                self.dexhand.weight_idx["thumb_tip"][0] - 1,
+                self.dexhand.weight_idx["index_tip"][0] - 1,
+                self.dexhand.weight_idx["middle_tip"][0] - 1,
+                self.dexhand.weight_idx["ring_tip"][0] - 1,
+                self.dexhand.weight_idx["pinky_tip"][0] - 1,
+            ]
+            self._fingertip_indices = torch.tensor(
+                tip_body_indices, dtype=torch.long, device=self.sim_device
+            )
+        else:
+            self._fingertip_indices = None
+
     def pack_data(self, data):
         packed_data = {}
         packed_data["seq_len"] = torch.tensor([len(d["obj_trajectory"]) for d in data], device=self.device)
@@ -531,16 +552,30 @@ class DexHandManipRHEnv(VecTask):
             if k == "mano_joints" or k == "mano_joints_velocity":
                 mano_joints = []
                 for d in data:
-                    mano_joints.append(
-                        torch.concat(
-                            [
-                                d[k][self.dexhand.to_hand(j_name)[0]]
-                                for j_name in self.dexhand.body_names
-                                if self.dexhand.to_hand(j_name)[0] != "wrist"
-                            ],
-                            dim=-1,
+                    if self.use_fingertips_only:
+                        mano_joints.append(
+                            torch.concat(
+                                [
+                                    d[k]["thumb_tip"],
+                                    d[k]["index_tip"],
+                                    d[k]["middle_tip"],
+                                    d[k]["ring_tip"],
+                                    d[k]["pinky_tip"],
+                                ],
+                                dim=-1,
+                            )
                         )
-                    )
+                    else:
+                        mano_joints.append(
+                            torch.concat(
+                                [
+                                    d[k][self.dexhand.to_hand(j_name)[0]]
+                                    for j_name in self.dexhand.body_names
+                                    if self.dexhand.to_hand(j_name)[0] != "wrist"
+                                ],
+                                dim=-1,
+                            )
+                        )
                 packed_data[k] = fill_data(mano_joints)
             elif type(data[0][k]) == torch.Tensor:
                 stack_data = [d[k] for d in data]
@@ -850,24 +885,55 @@ class DexHandManipRHEnv(VecTask):
         if self.rollout_len is not None:
             max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + 3 + 1)
 
-        (
-            self.rew_buf[:],
-            self.reset_buf[:],
-            self.success_buf[:],
-            self.failure_buf[:],
-            self.reward_dict,
-            self.error_buf[:],
-        ) = compute_imitation_reward(
-            self.reset_buf,
-            self.progress_buf,
-            self.running_progress_buf,
-            self.actions,
-            self.states,
-            target_state,
-            max_length,
-            scale_factor,
-            self.dexhand.weight_idx,
-        )
+        if self.use_fingertips_only:
+            fingertip_state = self.states["joints_state"][:, 1:][:, self._fingertip_indices]
+            jit_states = {
+                "base_state": self.states["base_state"],
+                "q": self.states["q"],
+                "dq": self.states["dq"],
+                "manip_obj_pos": self.states["manip_obj_pos"],
+                "manip_obj_quat": self.states["manip_obj_quat"],
+                "manip_obj_vel": self.states["manip_obj_vel"],
+                "manip_obj_ang_vel": self.states["manip_obj_ang_vel"],
+                "fingertip_pos": fingertip_state[:, :, :3].contiguous(),
+                "fingertip_vel": fingertip_state[:, :, 7:10].contiguous(),
+            }
+            (
+                self.rew_buf[:],
+                self.reset_buf[:],
+                self.success_buf[:],
+                self.failure_buf[:],
+                self.reward_dict,
+                self.error_buf[:],
+            ) = compute_imitation_reward_fingertip(
+                self.reset_buf,
+                self.progress_buf,
+                self.running_progress_buf,
+                self.actions,
+                jit_states,
+                target_state,
+                max_length,
+                scale_factor,
+            )
+        else:
+            (
+                self.rew_buf[:],
+                self.reset_buf[:],
+                self.success_buf[:],
+                self.failure_buf[:],
+                self.reward_dict,
+                self.error_buf[:],
+            ) = compute_imitation_reward(
+                self.reset_buf,
+                self.progress_buf,
+                self.running_progress_buf,
+                self.actions,
+                self.states,
+                target_state,
+                max_length,
+                scale_factor,
+                self.dexhand.weight_idx,
+            )
         self.total_rew_buf += self.rew_buf
 
     def compute_observations(self):
@@ -955,11 +1021,17 @@ class DexHandManipRHEnv(VecTask):
         next_target_state["delta_wrist_ang_vel"] = (target_wrist_ang_vel - cur_wrist_ang_vel[:, None]).reshape(nE, -1)
 
         target_joints_pos = indicing(self.demo_data["mano_joints"], cur_idx).reshape(nE, nF, -1, 3)
-        cur_joint_pos = self.states["joints_state"][:, 1:, :3]  # skip the base joint
+        if self.use_fingertips_only:
+            cur_joint_pos = self.states["joints_state"][:, 1:][:, self._fingertip_indices, :3]
+        else:
+            cur_joint_pos = self.states["joints_state"][:, 1:, :3]  # skip the base joint
         next_target_state["delta_joints_pos"] = (target_joints_pos - cur_joint_pos[:, None]).reshape(self.num_envs, -1)
 
         target_joints_vel = indicing(self.demo_data["mano_joints_velocity"], cur_idx).reshape(nE, nF, -1, 3)
-        cur_joint_vel = self.states["joints_state"][:, 1:, 7:10]  # skip the base joint
+        if self.use_fingertips_only:
+            cur_joint_vel = self.states["joints_state"][:, 1:][:, self._fingertip_indices, 7:10]
+        else:
+            cur_joint_vel = self.states["joints_state"][:, 1:, 7:10]  # skip the base joint
         next_target_state["joints_vel"] = target_joints_vel.reshape(self.num_envs, -1)
         next_target_state["delta_joints_vel"] = (target_joints_vel - cur_joint_vel[:, None]).reshape(self.num_envs, -1)
 
@@ -1203,7 +1275,7 @@ class DexHandManipRHEnv(VecTask):
     def pre_physics_step(self, actions):
 
         # ? >>> for visualization
-        if not self.headless:
+        if not self.headless and not self.use_fingertips_only:
 
             cur_idx = self.progress_buf
 
@@ -1594,6 +1666,176 @@ def compute_imitation_reward(
         "reward_finger_tip_force": reward_finger_tip_force,
     }
 
+    return reward_execute, reset_buf, succeeded, failed_execute, reward_dict, error_buf
+
+
+@torch.jit.script
+def compute_imitation_reward_fingertip(
+    reset_buf: Tensor,
+    progress_buf: Tensor,
+    running_progress_buf: Tensor,
+    actions: Tensor,
+    states: Dict[str, Tensor],
+    target_states: Dict[str, Tensor],
+    max_length: Tensor,
+    scale_factor: float,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]:
+
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
+    # Manus pipeline: reference data has only 5 fingertips. The env precomputes
+    # fingertip_pos / fingertip_vel from the dexhand's fingertip body states so
+    # shapes line up with the 5-key target. level_1 / level_2 reward terms are
+    # dropped because no reference exists for non-tip joints.
+
+    current_eef_pos = states["base_state"][:, :3]
+    current_eef_quat = states["base_state"][:, 3:7]
+    target_eef_pos = target_states["wrist_pos"]
+    target_eef_quat = target_states["wrist_quat"]
+    diff_eef_pos = target_eef_pos - current_eef_pos
+    diff_eef_pos_dist = torch.norm(diff_eef_pos, dim=-1)
+
+    current_eef_vel = states["base_state"][:, 7:10]
+    current_eef_ang_vel = states["base_state"][:, 10:13]
+    target_eef_vel = target_states["wrist_vel"]
+    target_eef_ang_vel = target_states["wrist_ang_vel"]
+    diff_eef_vel = target_eef_vel - current_eef_vel
+    diff_eef_ang_vel = target_eef_ang_vel - current_eef_ang_vel
+
+    fingertip_pos = states["fingertip_pos"]            # (B, 5, 3)
+    target_joints_pos = target_states["joints_pos"]    # (B, 5, 3)
+    diff_joints_pos = target_joints_pos - fingertip_pos
+    diff_joints_pos_dist = torch.norm(diff_joints_pos, dim=-1)  # (B, 5)
+
+    diff_thumb_tip_pos_dist = diff_joints_pos_dist[:, 0]
+    diff_index_tip_pos_dist = diff_joints_pos_dist[:, 1]
+    diff_middle_tip_pos_dist = diff_joints_pos_dist[:, 2]
+    diff_ring_tip_pos_dist = diff_joints_pos_dist[:, 3]
+    diff_pinky_tip_pos_dist = diff_joints_pos_dist[:, 4]
+
+    fingertip_vel = states["fingertip_vel"]
+    target_joints_vel = target_states["joints_vel"]
+    diff_joints_vel = target_joints_vel - fingertip_vel
+
+    reward_eef_pos = torch.exp(-40 * diff_eef_pos_dist)
+    reward_thumb_tip_pos = torch.exp(-100 * diff_thumb_tip_pos_dist)
+    reward_index_tip_pos = torch.exp(-90 * diff_index_tip_pos_dist)
+    reward_middle_tip_pos = torch.exp(-80 * diff_middle_tip_pos_dist)
+    reward_pinky_tip_pos = torch.exp(-60 * diff_pinky_tip_pos_dist)
+    reward_ring_tip_pos = torch.exp(-60 * diff_ring_tip_pos_dist)
+
+    reward_eef_vel = torch.exp(-1 * diff_eef_vel.abs().mean(dim=-1))
+    reward_eef_ang_vel = torch.exp(-1 * diff_eef_ang_vel.abs().mean(dim=-1))
+    reward_joints_vel = torch.exp(-1 * diff_joints_vel.abs().mean(dim=-1).mean(-1))
+    current_dof_vel = states["dq"]
+
+    diff_eef_rot = quat_mul(target_eef_quat, quat_conjugate(current_eef_quat))
+    diff_eef_rot_angle = quat_to_angle_axis(diff_eef_rot)[0]
+    reward_eef_rot = torch.exp(-1 * (diff_eef_rot_angle).abs())
+
+    current_obj_pos = states["manip_obj_pos"]
+    current_obj_quat = states["manip_obj_quat"]
+    target_obj_pos = target_states["manip_obj_pos"]
+    target_obj_quat = target_states["manip_obj_quat"]
+    diff_obj_pos = target_obj_pos - current_obj_pos
+    diff_obj_pos_dist = torch.norm(diff_obj_pos, dim=-1)
+    reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
+
+    diff_obj_rot = quat_mul(target_obj_quat, quat_conjugate(current_obj_quat))
+    diff_obj_rot_angle = quat_to_angle_axis(diff_obj_rot)[0]
+    reward_obj_rot = torch.exp(-3 * (diff_obj_rot_angle).abs())
+
+    current_obj_vel = states["manip_obj_vel"]
+    target_obj_vel = target_states["manip_obj_vel"]
+    diff_obj_vel = target_obj_vel - current_obj_vel
+    reward_obj_vel = torch.exp(-1 * diff_obj_vel.abs().mean(dim=-1))
+
+    current_obj_ang_vel = states["manip_obj_ang_vel"]
+    target_obj_ang_vel = target_states["manip_obj_ang_vel"]
+    diff_obj_ang_vel = target_obj_ang_vel - current_obj_ang_vel
+    reward_obj_ang_vel = torch.exp(-1 * diff_obj_ang_vel.abs().mean(dim=-1))
+
+    reward_power = torch.exp(-10 * target_states["power"])
+    reward_wrist_power = torch.exp(-2 * target_states["wrist_power"])
+
+    finger_tip_force = target_states["tip_force"]
+    finger_tip_distance = target_states["tips_distance"]
+    contact_range = [0.02, 0.03]
+    finger_tip_weight = torch.clamp(
+        (contact_range[1] - finger_tip_distance) / (contact_range[1] - contact_range[0]), 0, 1
+    )
+    finger_tip_force_masked = finger_tip_force * finger_tip_weight[:, :, None]
+    reward_finger_tip_force = torch.exp(-1 * (1 / (torch.norm(finger_tip_force_masked, dim=-1).sum(-1) + 1e-5)))
+
+    error_buf = (
+        (torch.norm(current_eef_vel, dim=-1) > 100)
+        | (torch.norm(current_eef_ang_vel, dim=-1) > 200)
+        | (torch.norm(fingertip_vel, dim=-1).mean(-1) > 100)
+        | (torch.abs(current_dof_vel).mean(-1) > 200)
+        | (torch.norm(current_obj_vel, dim=-1) > 100)
+        | (torch.norm(current_obj_ang_vel, dim=-1) > 200)
+    )
+
+    failed_execute = (
+        (
+            (diff_obj_pos_dist > 0.02 / 0.343 * scale_factor**3)
+            | (diff_thumb_tip_pos_dist > 0.04 / 0.7 * scale_factor)
+            | (diff_index_tip_pos_dist > 0.045 / 0.7 * scale_factor)
+            | (diff_middle_tip_pos_dist > 0.05 / 0.7 * scale_factor)
+            | (diff_pinky_tip_pos_dist > 0.06 / 0.7 * scale_factor)
+            | (diff_ring_tip_pos_dist > 0.06 / 0.7 * scale_factor)
+            | (diff_obj_rot_angle.abs() / np.pi * 180 > 30 / 0.343 * scale_factor**3)
+            | torch.any((finger_tip_distance < 0.005) & ~(target_states["tip_contact_state"].any(1)), dim=-1)
+        )
+        & (running_progress_buf >= 8)
+    ) | error_buf
+
+    reward_execute = (
+        0.1 * reward_eef_pos
+        + 0.6 * reward_eef_rot
+        + 0.9 * reward_thumb_tip_pos
+        + 0.8 * reward_index_tip_pos
+        + 0.75 * reward_middle_tip_pos
+        + 0.6 * reward_pinky_tip_pos
+        + 0.6 * reward_ring_tip_pos
+        + 5.0 * reward_obj_pos
+        + 1.0 * reward_obj_rot
+        + 0.1 * reward_eef_vel
+        + 0.05 * reward_eef_ang_vel
+        + 0.1 * reward_joints_vel
+        + 0.1 * reward_obj_vel
+        + 0.1 * reward_obj_ang_vel
+        + 1.0 * reward_finger_tip_force
+        + 0.5 * reward_power
+        + 0.5 * reward_wrist_power
+    )
+
+    succeeded = (progress_buf + 1 + 3 >= max_length) & ~failed_execute
+    reset_buf = torch.where(
+        succeeded | failed_execute,
+        torch.ones_like(reset_buf),
+        reset_buf,
+    )
+    reward_dict = {
+        "reward_eef_pos": reward_eef_pos,
+        "reward_eef_rot": reward_eef_rot,
+        "reward_eef_vel": reward_eef_vel,
+        "reward_eef_ang_vel": reward_eef_ang_vel,
+        "reward_joints_vel": reward_joints_vel,
+        "reward_obj_pos": reward_obj_pos,
+        "reward_obj_rot": reward_obj_rot,
+        "reward_obj_vel": reward_obj_vel,
+        "reward_obj_ang_vel": reward_obj_ang_vel,
+        "reward_joints_pos": (
+            reward_thumb_tip_pos
+            + reward_index_tip_pos
+            + reward_middle_tip_pos
+            + reward_pinky_tip_pos
+            + reward_ring_tip_pos
+        ),
+        "reward_power": reward_power,
+        "reward_wrist_power": reward_wrist_power,
+        "reward_finger_tip_force": reward_finger_tip_force,
+    }
     return reward_execute, reset_buf, succeeded, failed_execute, reward_dict, error_buf
 
 

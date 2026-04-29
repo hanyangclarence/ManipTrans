@@ -14,6 +14,12 @@ TASK_MAP = {
     "ResDexHandRH": DexHandManipRHEnv,
     "ResDexHandLH": DexHandManipLHEnv,
     "ResDexHandBiH": DexHandManipBiHEnv,
+    # Manus pipeline reuses the same env classes; the tasks just toggle the
+    # useFingertipsOnly flag in config and load the manus dataset.
+    "DexHandImitatorManusRH": DexHandImitatorRHEnv,
+    "DexHandImitatorManusLH": DexHandImitatorLHEnv,
+    "ResDexHandManusRH": DexHandManipRHEnv,
+    "ResDexHandManusLH": DexHandManipLHEnv,
 }
 
 

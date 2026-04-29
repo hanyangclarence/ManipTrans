@@ -145,8 +145,11 @@ class ManipData(Dataset, ABC):
             )
 
         if len(data["obj_trajectory"]) > self.max_seq_len:
+            # idx may be a string (manus pipeline) or int — use data['data_path']
+            # which every subclass sets, falling back to idx if absent.
+            label = data.get("data_path", idx)
             cprint(
-                f"WARN: {self.data_pathes[idx]} is too long : {len(data['obj_trajectory'])}, cut to {self.max_seq_len}",
+                f"WARN: {label} is too long : {len(data['obj_trajectory'])}, cut to {self.max_seq_len}",
                 "yellow",
             )
             data["obj_trajectory"] = data["obj_trajectory"][: self.max_seq_len]

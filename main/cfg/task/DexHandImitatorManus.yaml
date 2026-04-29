@@ -1,0 +1,92 @@
+# Manus-pipeline variant of DexHandImitator: target trajectories carry only the
+# 5 fingertip mano_joints, so the env collapses pack_data / joints obs / reward
+# to those 5 keys (useFingertipsOnly: True).
+name: ${concat:DexHandImitatorManus,${..side}}
+
+physics_engine: ${..physics_engine}
+seed: ${..seed}
+
+env:
+  numEnvs: ${resolve_default:8192,${...num_envs}}
+  dexhand: ${...dexhand}
+
+  episodeLength: 2000
+  training: ${if:${...test},False,True}
+
+  usePIDControl: ${...usePIDControl}
+
+  rolloutStateInit: ${resolve_default:False,${...rolloutStateInit}}
+  randomStateInit: ${resolve_default:True,${...randomStateInit}}
+
+  dataIndices: ${resolve_default:[],${...dataIndices}}
+  obsFutureLength: 1
+
+  clipObservations: 5.0
+  clipActions: 1.0
+
+  furniture: just_one_leg
+
+  frankaDofNoise: 0.25
+
+  targetLiftHeight: 0.05
+  distanceReward: 0.1
+  liftReward: 1.0
+  successReward: 1.0
+
+  aggregateMode: 3
+
+  tightenMethod: "exp_decay"
+  tightenFactor: 0.7
+  tightenSteps: 128000
+
+  actionScale: 1.0
+  useQuatRot: false
+
+  useFingertipsOnly: True
+
+  propDumpInfo:
+    q: ${ndof:${....dexhand}}
+    dq: ${ndof:${....dexhand}}
+    base_state: 13
+
+  actionsMovingAverage: ${...actionsMovingAverage}
+  translationScale: 1.0
+  orientationScale: 0.1
+  bimanual_mode: ${...bimanual_mode}
+
+  propObsDim: ${is_both_hands:${eval:'13+${ndof:${...dexhand}}*3'},${...side}}
+  obsKeys:
+    - q
+    - cos_q
+    - sin_q
+    - base_state
+
+  privilegedObsDim: ${is_both_hands:${eval:'${ndof:${...dexhand}}'},${...side}}
+  privilegedObsKeys:
+    - dq
+
+  enableCameraSensors: False
+
+sim:
+  dt: 0.0166667
+  substeps: 2
+  up_axis: "z"
+  use_gpu_pipeline: ${eq:${...pipeline},"gpu"}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:"cuda",${....sim_device}}
+    num_position_iterations: 8
+    num_velocity_iterations: 1
+    contact_offset: 0.005
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 1000.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 1048576
+    num_subscenes: ${....num_subscenes}
+    contact_collection: 1
+
+task:
+  randomize: False

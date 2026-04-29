@@ -70,36 +70,49 @@ mano_joints      {5 *_tip keys: (T, 3)}
 opt_wrist_pos (T, 3), opt_wrist_rot (T, 3) axis-angle, opt_dof_pos (T, 20)
 ```
 
-## 3. Loader-side glue (still to write)
+## 3. Loader-side glue (already wired up)
 
-A `ManipData` subclass at `main/dataset/manus_dataset_dexhand_rh.py`:
+The pipeline is plumbed end-to-end via:
 
-- Read `sequences/<stem>.pkl` and return its dict; call
-  `self.process_data(...)` then
-  `self.load_retargeted_data(data, retargeting/<stem>.pkl)`.
-- In `__init__`, set `self.mujoco2gym_transf = torch.eye(4, ...)` so
-  `process_data` doesn't re-rotate (data is already gym frame).
-- Set `self.skip = 2` so `process_data`'s velocity time-delta
-  `self.skip / 120 = 1/60 s` matches 60 Hz; **don't** subsample.
-- Add a dispatch case in `main/dataset/factory.py:dataset_type` (e.g.
-  `manus@<stem>` → `"manus"`).
-- `mano_joints` only carries the 5 `*_tip` keys, so patch
-  `dexhandmanip_sh.py:533-545` (`pack_data`) and the reward to use those
-  five keys instead of iterating all `dexhand.body_names`.
+- `main/dataset/manus_dataset_dexhand_rh.py` — `ManipData` subclass registered
+  as `manus_rh`. Sets `mujoco2gym_transf=I`, `skip=2`, reads
+  `sequences/<stem>.pkl` + `retargeting/<stem>.pkl`, returns the dict ManipTrans
+  expects (`mano_joints` only carries the 5 `*_tip` keys).
+- `main/dataset/factory.py:dataset_type` dispatches `manus@*` → `"manus"`.
+- `maniptrans_envs/lib/envs/tasks/dexhandimitator.py` and
+  `…/dexhandmanip_sh.py` accept `env.useFingertipsOnly: True`. When set,
+  `pack_data` packs only thumb/index/middle/ring/pinky tips (15 dims), the
+  joints obs/reward are projected to those 5 fingertip bodies via
+  `dexhand.weight_idx`, and a parallel `compute_imitation_reward_fingertip`
+  jit replaces `level_1`/`level_2` reward terms (no reference exists for
+  non-tip joints).
+- `main/cfg/task/{DexHandImitatorManus,ResDexHandManus}.yaml` and
+  `main/cfg/rl_train/{DexHandImitatorManus,ResDexHandManus}PPO.yaml` set the
+  flag and the reduced target-encoder input dim
+  (`3+3+3+4+4+3+3+5*3*3 = 68` instead of `… + (n_bodies-1)*9`).
+- `maniptrans_envs/lib/__init__.py:TASK_MAP` adds `DexHandImitatorManus{RH,LH}`
+  / `ResDexHandManus{RH,LH}` aliases to the existing env classes.
 
-Then:
+`dataIndices` for the manus pipeline use the form
+`manus@<dataset_root>@<stem>` (e.g.
+`manus@manus_marker_pen@20260201_154446_552807`). `<dataset_root>` is the
+directory under `data/` produced by `convert_manus_to_maniptrans.py`.
 
 ```bash
-# stage 1: imitator
-python main/rl/train.py task=DexHandImitator dexhand=wujihand side=RH \
-  dataIndices=[manus@<stem>] num_envs=4096 ...
+# stage 1: imitator (manus pipeline = fingertip-only target)
+python main/rl/train.py task=DexHandImitatorManus dexhand=wujihand side=RH \
+  dataIndices=[manus@manus_marker_pen@20260201_154446_552807] num_envs=4096
 
-# stage 2: residual
-python main/rl/train.py task=ResDexHand dexhand=wujihand side=RH \
-  dataIndices=[manus@<stem>] \
-  rh_base_model_checkpoint=runs/.../imit_*.pth \
-  lh_base_model_checkpoint=runs/.../imit_*.pth ...
+# stage 2: residual (must reuse the imitator ckpt trained with the same flag)
+python main/rl/train.py task=ResDexHandManus dexhand=wujihand side=RH \
+  dataIndices=[manus@manus_marker_pen@20260201_154446_552807] \
+  rh_base_model_checkpoint=runs/DexHandImitatorManus.../nn/last_*.pth \
+  lh_base_model_checkpoint=runs/DexHandImitatorManus.../nn/last_*.pth
 ```
+
+Don't mix imitator checkpoints between the manus and standard pipelines: the
+target-encoder input dims differ (68 vs `… + (n_bodies-1)*9`), so the residual
+loader will refuse to load a mismatched base model.
 
 ## 4. Visualize
 

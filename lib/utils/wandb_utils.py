@@ -20,12 +20,21 @@ class WandbAlgoObserver(AlgoObserver):
         sync_tensorboard does not work.
         """
 
+        import os
+
         import wandb
 
         wandb_unique_id = f"uid_{experiment_name}"
         print(f"Wandb using unique id {wandb_unique_id}")
 
         cfg = self.cfg
+
+        # rl_games and the env both create per-component event-log subdirs under
+        # this root (summaries/, summaries/reward_dict/iter/<k>/, etc.). Patching
+        # the root before init lets wandb pick all of them up via sync_tensorboard.
+        train_dir = config.get("train_dir", "runs") if isinstance(config, dict) else "runs"
+        summaries_root = os.path.join(train_dir, experiment_name, "summaries")
+        wandb.tensorboard.patch(root_logdir=summaries_root, pytorch=True)
 
         # this can fail occasionally, so we try a couple more times
         @retry(3, exceptions=(Exception,))
