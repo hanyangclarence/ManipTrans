@@ -92,13 +92,13 @@ class WandbVideoCaptureWrapper(gym.Wrapper):
     def step(self, action):
         obs, reward, done, info = super().step(action)
         for i, idx in enumerate(self._rcd_idxs):
-            self._videos[i].append(self.env.camera_obs[idx].clone())
+            self._videos[i].append(self.env.camera_obs[idx].detach().cpu())
         if torch.any(done):
             for i, idx in enumerate(self._rcd_idxs):
                 if done[idx]:
                     video = torch.stack(self._videos[i])[..., :-1]  # (T, H, W, C), RGBA -> RGB
                     video = video.to(dtype=torch.uint8)
-                    video = video.permute(0, 3, 1, 2).detach().cpu().numpy()  # (T, C, H, W)
+                    video = video.permute(0, 3, 1, 2).numpy()  # (T, C, H, W)
                     video = wandb.Video(video, fps=10, format="mp4")
                     succeeded = self.env.success_buf
                     failed = self.env.failure_buf

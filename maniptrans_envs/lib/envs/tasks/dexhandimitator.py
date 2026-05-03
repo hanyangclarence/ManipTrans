@@ -37,6 +37,7 @@ from ..core.config import ROBOT_HEIGHT, config
 from ...envs.core.sim_config import sim_config
 from ...envs.core.vec_task import VecTask
 from ...utils.pose_utils import get_mat
+from ._xarm_helpers import ARM_TRAJECTORY_Z_SHIFT, XArmIKMixin
 import pickle
 
 
@@ -44,7 +45,7 @@ def soft_clamp(x, lower, upper):
     return lower + torch.sigmoid(4 / (upper - lower) * (x - (lower + upper) / 2)) * (upper - lower)
 
 
-class DexHandImitatorRHEnv(VecTask):
+class DexHandImitatorRHEnv(XArmIKMixin, VecTask):
     side = "right"
 
     def __init__(
@@ -80,9 +81,19 @@ class DexHandImitatorRHEnv(VecTask):
             self.Ki_pos = self.dexhand.Ki_pos
             self.Kd_pos = self.dexhand.Kd_pos
 
-        self.cfg["env"]["numActions"] = (
-            (1 + 6 + self.dexhand.n_dofs) if use_quat_rot else (6 + self.dexhand.n_dofs)
-        ) + (3 if self.use_pid_control else 0)
+        # Arm-mounted dexhands replace the 6 floating-wrist control dims
+        # with 7 arm joint targets driven by direct PD; useQuatRot /
+        # usePIDControl are floating-hand-only and forced off here.
+        if self.dexhand.n_arm_dofs > 0:
+            assert not use_quat_rot and not self.use_pid_control, (
+                f"useQuatRot/usePIDControl are not supported for arm-mounted "
+                f"dexhand '{self.dexhand.name}'. Set both to False."
+            )
+            self.cfg["env"]["numActions"] = self.dexhand.n_dofs   # 7 arm + 20 finger = 27
+        else:
+            self.cfg["env"]["numActions"] = (
+                (1 + 6 + self.dexhand.n_dofs) if use_quat_rot else (6 + self.dexhand.n_dofs)
+            ) + (3 if self.use_pid_control else 0)
         self.act_moving_average = self.cfg["env"]["actionsMovingAverage"]
         self.translation_scale = self.cfg["env"]["translationScale"]
         self.orientation_scale = self.cfg["env"]["orientationScale"]
@@ -133,6 +144,17 @@ class DexHandImitatorRHEnv(VecTask):
         self._global_dexhand_indices = None  # Unique indices corresponding to all envs in flattened array
 
         self.sim_device = torch.device(sim_device)
+
+        # Arm-mounted IK setup (used at env reset to seed arm DOFs from the
+        # demo wrist pose). Initialized before super().__init__() because
+        # super calls reset_idx() at the end, which solves IK.
+        self._ik_solver = None
+        self._arm_base_pos_t = None     # (3,) world-frame xArm base position
+        self._world_to_base_R_t = None  # (3, 3) world->arm-base rotation
+        self._arm_seed_t = None         # (n_arm_dofs,) IK warm-start
+        if self.dexhand.n_arm_dofs > 0:
+            self._init_arm_ik()
+
         super().__init__(
             config=self.cfg,
             rl_device=rl_device,
@@ -142,7 +164,15 @@ class DexHandImitatorRHEnv(VecTask):
             record=record,
             headless=headless,
         )
-        n_target_joints = 5 if self.use_fingertips_only else (self.dexhand.n_bodies - 1)
+        # Number of MANO target joints in the obs / reward. Floating dexhands
+        # use n_bodies - 1 (skip palm). Arm-mounted dexhands use the wuji-only
+        # subset minus 1, since pack_data filters arm bodies out of mano_joints.
+        if self.use_fingertips_only:
+            n_target_joints = 5
+        elif self.dexhand.joint_state_body_names is not None:
+            n_target_joints = len(self.dexhand.joint_state_body_names) - 1
+        else:
+            n_target_joints = self.dexhand.n_bodies - 1
         TARGET_OBS_DIM = (3 + 3 + 3 + 4 + 4 + 3 + 3 + n_target_joints * 9) * self.obs_future_length
         self.obs_dict.update(
             {
@@ -178,6 +208,70 @@ class DexHandImitatorRHEnv(VecTask):
         # Refresh tensors
         self._refresh()
 
+        # One-shot indexing audit (gated by env var) for arm-mounted dexhands.
+        if os.environ.get("MANIPTRANS_AUDIT_INDEXING") and self.dexhand.n_arm_dofs > 0:
+            self._audit_xarm_indexing()
+
+    def _audit_xarm_indexing(self):
+        """Print body / DOF index sanity check for arm-mounted dexhands.
+
+        Steps the sim once after reset so rigid-body world poses reflect FK
+        on the post-IK joint state (set_dof_state_tensor doesn't trigger an
+        FK update — only simulate() does).
+        """
+        import sys
+        # FK only refreshes after a sim step, so step once to expose the
+        # actual palm pose under the IK-derived joint configuration.
+        self.gym.simulate(self.sim)
+        self.gym.fetch_results(self.sim, True)
+        self._refresh()
+
+        dh = self.dexhand
+        print("\n" + "=" * 70)
+        print(f"AUDIT  dexhand={dh}  bodies={dh.n_bodies}  dofs={dh.n_dofs}")
+        print(f"       arm_bodies={dh.n_arm_bodies}  arm_dofs={dh.n_arm_dofs}")
+        print(f"       joint_state_body_names[:3] = {dh.joint_state_body_names[:3]}")
+        print(f"       weight_idx['thumb_tip'] = {dh.weight_idx['thumb_tip']}  (palm-relative)")
+        print("dexhand_handles (env-local body index):")
+        for n in ["link_base", "link7", "link_eef", "palm_link",
+                  "finger1_link1", "finger1_link4", "finger1_tip_link",
+                  "finger5_tip_link"]:
+            print(f"  {n:<22s} -> {self.dexhand_handles[n]}")
+
+        palm_idx = self.dexhand_handles[dh.to_dex("wrist")[0]]
+        palm = self._rigid_body_state[:, palm_idx, :13]
+        base = self.states["base_state"]
+        print(f"\npalm pos (env0) = {palm[0, :3].tolist()}")
+        print(f"base_state pos  = {base[0, :3].tolist()}")
+        print(f"  diff: {(palm[0, :3] - base[0, :3]).abs().max().item():.2e}  (must be ~0)")
+
+        js = self.states["joints_state"]
+        print(f"\njoints_state shape: {tuple(js.shape)}  (B, n_joint_state_bodies, 10)")
+        print(f"  row 0 (palm) vs base_state: "
+              f"{(js[0, 0, :3] - base[0, :3]).abs().max().item():.2e}")
+
+        ft_idx = self.dexhand_handles["finger1_tip_link"]
+        ft_g = self._rigid_body_state[0, ft_idx, :3]
+        ft_j = js[0, dh.weight_idx["thumb_tip"][0], :3]
+        print(f"\nfinger1_tip via dexhand_handles[{ft_idx}]: {ft_g.tolist()}")
+        print(f"finger1_tip via joints_state[0, 5]: {ft_j.tolist()}")
+        print(f"  diff: {(ft_g - ft_j).abs().max().item():.2e}  (must be ~0)")
+
+        q = self.states["q"]
+        print(f"\nq shape: {tuple(q.shape)}")
+        print(f"q[0, :7]  (arm IK output): "
+              f"[{', '.join(f'{x:+.4f}' for x in q[0, :7].tolist())}]")
+        print(f"q[0, 7:11] (finger1 joints): "
+              f"[{', '.join(f'{x:+.4f}' for x in q[0, 7:11].tolist())}]")
+
+        dw = self.demo_data["wrist_pos"][0, self.progress_buf[0]]
+        print(f"\ndemo wrist_pos[0, t={self.progress_buf[0].item()}]: {dw.tolist()}")
+        print(f"palm world pos (post-IK):                     {palm[0, :3].tolist()}")
+        print(f"||palm - demo|| (m): {(palm[0, :3] - dw).norm().item():.4f}  "
+              "(target < 1 cm if IK converged)")
+        print("=" * 70 + "\n")
+        sys.stdout.flush()
+
     def create_sim(self):
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
         self.sim_params.gravity.x = 0
@@ -209,24 +303,54 @@ class DexHandImitatorRHEnv(VecTask):
         table_asset_options = gymapi.AssetOptions()
         table_asset_options.fix_base_link = True
 
-        table_width_offset = 0.2
-        table_asset = self.gym.create_box(self.sim, 0.8 + table_width_offset, 1.6, 0.03, table_asset_options)
+        is_arm = self.dexhand.n_arm_bodies > 0
+        if is_arm:
+            # GP-equivalent table & arm placement, mapped through
+            # R_z(-90°) into IsaacGym frame. See visualize_xarm_wujihand_
+            # trajectory.py for the geometry derivation. Stage-1 imitator:
+            # table is non-collidable (collisionFilter handled later).
+            self._xarm_table_size = (1.0, 0.6, 0.02)
+            self._xarm_table_center = (0.0, -0.5, 0.09)   # top at z=0.10
+            table_asset = self.gym.create_box(
+                self.sim, *self._xarm_table_size, table_asset_options,
+            )
+            table_pos = gymapi.Vec3(*self._xarm_table_center)
+            self.dexhand_pose = gymapi.Transform()
+            self.dexhand_pose.p = gymapi.Vec3(*self.dexhand.arm_base_pos)
+            self.dexhand_pose.r = gymapi.Quat(*self.dexhand.arm_base_quat)
+            # Trajectory pickles already encode +0.415m z-shift to land
+            # objects on the legacy 0.415m table; the dataset loader
+            # inverts this with `mujoco2gym_transf` (set to identity in
+            # the manus loader). For the xarm path we need to additionally
+            # lower trajectories by 0.315m so they land on the new GP-style
+            # table at z=0.10. We do that via a post-pack_data shift below
+            # rather than hacking mujoco2gym_transf, so the dataset loader
+            # path stays untouched.
+            self._table_surface_z = self._xarm_table_center[2] + self._xarm_table_size[2] / 2  # = 0.10
+            mujoco2gym_transf = np.eye(4)
+            self.mujoco2gym_transf = torch.tensor(
+                mujoco2gym_transf, device=self.sim_device, dtype=torch.float32,
+            )
+        else:
+            # Original floating-hand layout.
+            table_width_offset = 0.2
+            table_asset = self.gym.create_box(self.sim, 0.8 + table_width_offset, 1.6, 0.03, table_asset_options)
 
-        table_pos = gymapi.Vec3(-table_width_offset / 2, 0, 0.4)
-        self.dexhand_pose = gymapi.Transform()
-        table_half_height = 0.015
-        table_half_width = 0.4
+            table_pos = gymapi.Vec3(-table_width_offset / 2, 0, 0.4)
+            self.dexhand_pose = gymapi.Transform()
+            table_half_height = 0.015
+            table_half_width = 0.4
 
-        self._table_surface_z = table_surface_z = table_pos.z + table_half_height
-        self.dexhand_pose.p = gymapi.Vec3(-table_half_width, 0, table_surface_z + ROBOT_HEIGHT)
-        self.dexhand_pose.r = gymapi.Quat.from_euler_zyx(0, -np.pi / 2, 0)
+            self._table_surface_z = table_surface_z = table_pos.z + table_half_height
+            self.dexhand_pose.p = gymapi.Vec3(-table_half_width, 0, table_surface_z + ROBOT_HEIGHT)
+            self.dexhand_pose.r = gymapi.Quat.from_euler_zyx(0, -np.pi / 2, 0)
 
-        mujoco2gym_transf = np.eye(4)
-        mujoco2gym_transf[:3, :3] = aa_to_rotmat(np.array([0, 0, -np.pi / 2])) @ aa_to_rotmat(
-            np.array([np.pi / 2, 0, 0])
-        )
-        mujoco2gym_transf[:3, 3] = np.array([0, 0, self._table_surface_z])
-        self.mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=self.sim_device, dtype=torch.float32)
+            mujoco2gym_transf = np.eye(4)
+            mujoco2gym_transf[:3, :3] = aa_to_rotmat(np.array([0, 0, -np.pi / 2])) @ aa_to_rotmat(
+                np.array([np.pi / 2, 0, 0])
+            )
+            mujoco2gym_transf[:3, 3] = np.array([0, 0, self._table_surface_z])
+            self.mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=self.sim_device, dtype=torch.float32)
 
         dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
 
@@ -250,23 +374,33 @@ class DexHandImitatorRHEnv(VecTask):
         asset_options.linear_damping = 20
         asset_options.max_linear_velocity = 50
         asset_options.max_angular_velocity = 100
-        asset_options.fix_base_link = False
-        asset_options.disable_gravity = True
+        # Floating dexhands have a free root that the env drives via
+        # apply_rigid_body_force_tensors. Arm-mounted dexhands bolt the
+        # base to the world (fix_base_link=True) and let gravity act so
+        # the arm PD must hold up the chain — same setup the GP env uses.
+        asset_options.fix_base_link = is_arm
+        asset_options.disable_gravity = not is_arm
         asset_options.flip_visual_attachments = False
         asset_options.collapse_fixed_joints = False
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_POS
         asset_options.use_mesh_materials = True
         dexhand_asset = self.gym.load_asset(self.sim, *os.path.split(dexhand_asset_file), asset_options)
+        # Per-DOF gains may be overridden on the dexhand class (e.g. WujiHand)
+        # whose URDF effort limits don't tolerate the global 500/30 defaults.
+        _kp = getattr(self.dexhand, "dof_kp", None)
+        _kd = getattr(self.dexhand, "dof_kd", None)
         dexhand_dof_stiffness = torch.tensor(
-            [500] * self.dexhand.n_dofs,
+            list(_kp) if _kp is not None else [500] * self.dexhand.n_dofs,
             dtype=torch.float,
             device=self.sim_device,
         )
         dexhand_dof_damping = torch.tensor(
-            [30] * self.dexhand.n_dofs,
+            list(_kd) if _kd is not None else [30] * self.dexhand.n_dofs,
             dtype=torch.float,
             device=self.sim_device,
         )
+        assert dexhand_dof_stiffness.numel() == self.dexhand.n_dofs
+        assert dexhand_dof_damping.numel() == self.dexhand.n_dofs
         self.limit_info = {}
         asset_rh_dof_props = self.gym.get_asset_dof_properties(dexhand_asset)
         self.limit_info["rh"] = {
@@ -296,6 +430,10 @@ class DexHandImitatorRHEnv(VecTask):
             dexhand_dof_props["driveMode"][i] = gymapi.DOF_MODE_POS
             dexhand_dof_props["stiffness"][i] = dexhand_dof_stiffness[i]
             dexhand_dof_props["damping"][i] = dexhand_dof_damping[i]
+            # Disable the URDF effort cap — values for WujiHand are not real
+            # and would saturate the position drive long before tracking error
+            # can be cleared.
+            dexhand_dof_props["effort"][i] = np.inf
 
             self.dexhand_dof_lower_limits.append(dexhand_dof_props["lower"][i])
             self.dexhand_dof_upper_limits.append(dexhand_dof_props["upper"][i])
@@ -330,6 +468,23 @@ class DexHandImitatorRHEnv(VecTask):
 
         self.demo_data = [segment_data(i) for i in tqdm(range(self.num_envs))]
         self.demo_data = self.pack_data(self.demo_data)
+
+        # Lower the trajectory onto the new GP-style table for arm-mounted
+        # dexhands. mano_joints is (B, T, n_joints*3); only every third
+        # element (the z-coord of each (x,y,z) keypoint) needs the shift.
+        if is_arm:
+            shift_z = ARM_TRAJECTORY_Z_SHIFT
+            self.demo_data["wrist_pos"][..., 2] += shift_z
+            if "obj_trajectory" in self.demo_data:
+                # obj_trajectory is (B, T, 4, 4) SE(3); shift the translation z.
+                self.demo_data["obj_trajectory"][..., 2, 3] += shift_z
+            if "mano_joints" in self.demo_data:
+                # Layout: last dim is concat of (x,y,z) per keypoint, so the
+                # 3rd, 6th, 9th, ... entries are the z-coords to shift.
+                mj = self.demo_data["mano_joints"]
+                mj[..., 2::3] += shift_z
+            if "opt_wrist_pos" in self.demo_data:
+                self.demo_data["opt_wrist_pos"][..., 2] += shift_z
 
         # Create environments
         num_per_row = int(np.sqrt(self.num_envs))
@@ -519,11 +674,18 @@ class DexHandImitatorRHEnv(VecTask):
                             )
                         )
                     else:
+                        # Iterate over the dexhand's "joint state" bodies
+                        # (== body_names for floating hands, == wuji-only
+                        # subset for arm-mounted hands) so xarm doesn't try
+                        # to look up a MANO mapping for arm links.
+                        joint_body_names = (
+                            self.dexhand.joint_state_body_names or self.dexhand.body_names
+                        )
                         mano_joints.append(
                             torch.concat(
                                 [
                                     d[k][self.dexhand.to_hand(j_name)[0]]
-                                    for j_name in self.dexhand.body_names
+                                    for j_name in joint_body_names
                                     if self.dexhand.to_hand(j_name)[0] != "wrist"
                                 ],
                                 dim=-1,
@@ -571,18 +733,33 @@ class DexHandImitatorRHEnv(VecTask):
             }
 
     def _update_states(self):
+        # For floating-hand setups the actor root IS the wrist, so
+        # `_base_state` directly provides the wrist's 13-D state. For
+        # arm-mounted setups the actor root is the fixed arm base; we
+        # substitute palm_link's rigid-body state, which the rest of the
+        # pipeline (rewards, obs, JIT functions) treats as "the wrist".
+        if self.dexhand.n_arm_bodies > 0:
+            wrist_body = self.dexhand.to_dex("wrist")[0]   # "palm_link"
+            base_state = self._rigid_body_state[:, self.dexhand_handles[wrist_body], :]
+        else:
+            base_state = self._base_state[:, :]
+
         self.states.update(
             {
                 "q": self._q[:, :],
                 "cos_q": torch.cos(self._q[:, :]),
                 "sin_q": torch.sin(self._q[:, :]),
                 "dq": self._qd[:, :],
-                "base_state": self._base_state[:, :],
+                "base_state": base_state,
             }
         )
 
+        # joint_state_body_names defaults to body_names for floating dexhands
+        # and drops the 9 arm bodies for arm-mounted dexhands so the reward's
+        # `joints_state[:, 1:]` slice still spans the wuji bodies.
+        joint_body_names = self.dexhand.joint_state_body_names or self.dexhand.body_names
         self.states["joints_state"] = torch.stack(
-            [self._rigid_body_state[:, self.dexhand_handles[k], :][:, :10] for k in self.dexhand.body_names],
+            [self._rigid_body_state[:, self.dexhand_handles[k], :][:, :10] for k in joint_body_names],
             dim=1,
         )
 
@@ -870,11 +1047,34 @@ class DexHandImitatorRHEnv(VecTask):
 
         opt_hand_pose_vel = torch.concat([opt_wrist_pos, opt_wrist_rot, opt_wrist_vel, opt_wrist_ang_vel], dim=-1)
 
-        self._base_state[env_ids, :] = opt_hand_pose_vel
+        n_arm_dofs = self.dexhand.n_arm_dofs
+        if n_arm_dofs > 0:
+            # Solve batch IK to put palm_link at the (noisy) demo wrist pose.
+            # opt_wrist_rot at this point is (B, 4) wxyz-permuted-to-xyzw quat;
+            # convert back to a rotation matrix for the IK target.
+            # The pre-noise rotation matrix (`opt_wrist_rot` line above) was
+            # already overwritten — recompute from quaternion.
+            from main.dataset.transform import quat_to_rotmat as _q2r
+            R_world = _q2r(opt_wrist_rot[:, [3, 0, 1, 2]])      # xyzw -> wxyz
+            arm_q, ik_ok = self._solve_arm_ik(opt_wrist_pos, R_world)
 
-        self._q[env_ids, :] = dof_pos
-        self._qd[env_ids, :] = dof_vel
-        self._pos_control[env_ids, :] = dof_pos
+            # Build the full 27-D dof_pos: arm from IK, fingers from
+            # randomized default. dof_pos / dof_vel were sized to n_dofs.
+            dof_pos_full = dof_pos.clone()
+            dof_pos_full[:, :n_arm_dofs] = arm_q
+            dof_vel_full = dof_vel.clone()
+            dof_vel_full[:, :n_arm_dofs] = 0.0   # zero arm velocity at reset
+
+            self._q[env_ids, :] = dof_pos_full
+            self._qd[env_ids, :] = dof_vel_full
+            self._pos_control[env_ids, :] = dof_pos_full
+            # NOTE: do NOT overwrite self._base_state — actor root is the
+            # fixed arm base (link_base) for arm-mounted dexhands.
+        else:
+            self._base_state[env_ids, :] = opt_hand_pose_vel
+            self._q[env_ids, :] = dof_pos
+            self._qd[env_ids, :] = dof_vel
+            self._pos_control[env_ids, :] = dof_pos
 
         # Deploy updates for dexhand
         dexhand_multi_env_ids_int32 = self._global_dexhand_indices[env_ids].flatten()
@@ -885,12 +1085,16 @@ class DexHandImitatorRHEnv(VecTask):
             gymtorch.unwrap_tensor(dexhand_multi_env_ids_int32),
             len(dexhand_multi_env_ids_int32),
         )
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self._root_state),
-            gymtorch.unwrap_tensor(dexhand_multi_env_ids_int32),
-            len(dexhand_multi_env_ids_int32),
-        )
+        if n_arm_dofs == 0:
+            # Skipping for arm-mounted dexhands: actor root is fix_base_link,
+            # so writing it back is wasted bandwidth (and risks overwriting
+            # the per-env spawn pose if anything mis-tracks indices).
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self._root_state),
+                gymtorch.unwrap_tensor(dexhand_multi_env_ids_int32),
+                len(dexhand_multi_env_ids_int32),
+            )
         self.gym.set_dof_position_target_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self._pos_control),
@@ -981,15 +1185,37 @@ class DexHandImitatorRHEnv(VecTask):
         # ? <<< for visualization
         curr_act_moving_average = self.act_moving_average
 
-        root_control_dim = 9 if self.use_pid_control else 6
+        n_arm_dofs = self.dexhand.n_arm_dofs
+        if n_arm_dofs > 0:
+            # Arm-mounted action layout: [arm deltas (7), finger absolute (n)],
+            # mirroring the GP `_apply_xarm_rel_hand_abs_control` mode.
+            arm_action_scale = self.cfg["env"].get("baseActionScale", 0.025)
+            arm_action = torch.clamp(actions[:, :n_arm_dofs], -1.0, 1.0)
+            arm_target = self._q[:, :n_arm_dofs] + arm_action * arm_action_scale
+            arm_target = torch.clamp(
+                arm_target,
+                self.dexhand_dof_lower_limits[:n_arm_dofs],
+                self.dexhand_dof_upper_limits[:n_arm_dofs],
+            )
 
-        dof_pos = actions[:, root_control_dim : root_control_dim + self.num_dexhand_dofs]
-        dof_pos = torch.clamp(dof_pos, -1, 1)
-        self.curr_targets = torch_jit_utils.scale(
-            dof_pos,  # ! actions must in [-1, 1]
-            self.dexhand_dof_lower_limits,
-            self.dexhand_dof_upper_limits,
-        )
+            finger_action = torch.clamp(
+                actions[:, n_arm_dofs:n_arm_dofs + (self.num_dexhand_dofs - n_arm_dofs)], -1.0, 1.0,
+            )
+            finger_target = torch_jit_utils.scale(
+                finger_action,
+                self.dexhand_dof_lower_limits[n_arm_dofs:],
+                self.dexhand_dof_upper_limits[n_arm_dofs:],
+            )
+            self.curr_targets = torch.cat([arm_target, finger_target], dim=-1)
+        else:
+            root_control_dim = 9 if self.use_pid_control else 6
+            dof_pos = actions[:, root_control_dim : root_control_dim + self.num_dexhand_dofs]
+            dof_pos = torch.clamp(dof_pos, -1, 1)
+            self.curr_targets = torch_jit_utils.scale(
+                dof_pos,  # ! actions must in [-1, 1]
+                self.dexhand_dof_lower_limits,
+                self.dexhand_dof_upper_limits,
+            )
         self.curr_targets = (
             curr_act_moving_average * self.curr_targets + (1.0 - curr_act_moving_average) * self.prev_targets
         )
@@ -999,49 +1225,53 @@ class DexHandImitatorRHEnv(VecTask):
             self.dexhand_dof_upper_limits,
         )
 
-        if self.use_pid_control:
-            position_error = actions[:, :3]
-            self.pos_error_integral += position_error * self.dt
-            self.pos_error_integral = torch.clamp(self.pos_error_integral, -1, 1)
-            pos_derivative = (position_error - self.prev_pos_error) / self.dt
-            force = self.Kp_pos * position_error + self.Ki_pos * self.pos_error_integral + self.Kd_pos * pos_derivative
-            self.prev_pos_error = position_error
-            self.apply_forces[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :] = (
-                curr_act_moving_average * force
-                + (1.0 - curr_act_moving_average)
-                * self.apply_forces[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :]
-            )
+        # Wrist forces apply only to floating-hand setups; the arm-mounted
+        # path drives palm_link via the arm's PD chain instead, so no
+        # external force needs to be injected.
+        if n_arm_dofs == 0:
+            if self.use_pid_control:
+                position_error = actions[:, :3]
+                self.pos_error_integral += position_error * self.dt
+                self.pos_error_integral = torch.clamp(self.pos_error_integral, -1, 1)
+                pos_derivative = (position_error - self.prev_pos_error) / self.dt
+                force = self.Kp_pos * position_error + self.Ki_pos * self.pos_error_integral + self.Kd_pos * pos_derivative
+                self.prev_pos_error = position_error
+                self.apply_forces[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :] = (
+                    curr_act_moving_average * force
+                    + (1.0 - curr_act_moving_average)
+                    * self.apply_forces[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :]
+                )
 
-            rotation_error = actions[:, 3:9]
-            rotation_error = rot6d_to_aa(rotation_error)
-            self.rot_error_integral += rotation_error * self.dt
-            self.rot_error_integral = torch.clamp(self.rot_error_integral, -1, 1)
-            rot_derivative = (rotation_error - self.prev_rot_error) / self.dt
-            torque = self.Kp_rot * rotation_error + self.Ki_rot * self.rot_error_integral + self.Kd_rot * rot_derivative
-            self.prev_rot_error = rotation_error
-            self.apply_torque[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :] = (
-                curr_act_moving_average * torque
-                + (1.0 - curr_act_moving_average)
-                * self.apply_torque[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :]
-            )
+                rotation_error = actions[:, 3:9]
+                rotation_error = rot6d_to_aa(rotation_error)
+                self.rot_error_integral += rotation_error * self.dt
+                self.rot_error_integral = torch.clamp(self.rot_error_integral, -1, 1)
+                rot_derivative = (rotation_error - self.prev_rot_error) / self.dt
+                torque = self.Kp_rot * rotation_error + self.Ki_rot * self.rot_error_integral + self.Kd_rot * rot_derivative
+                self.prev_rot_error = rotation_error
+                self.apply_torque[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :] = (
+                    curr_act_moving_average * torque
+                    + (1.0 - curr_act_moving_average)
+                    * self.apply_torque[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :]
+                )
 
-        else:
-            self.apply_forces[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :] = (
-                curr_act_moving_average * (actions[:, 0:3] * self.dt * self.translation_scale * 500)
-                + (1.0 - curr_act_moving_average)
-                * self.apply_forces[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :]
+            else:
+                self.apply_forces[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :] = (
+                    curr_act_moving_average * (actions[:, 0:3] * self.dt * self.translation_scale * 500)
+                    + (1.0 - curr_act_moving_average)
+                    * self.apply_forces[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :]
+                )
+                self.apply_torque[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :] = (
+                    curr_act_moving_average * (actions[:, 3:6] * self.dt * self.orientation_scale * 200)
+                    + (1.0 - curr_act_moving_average)
+                    * self.apply_torque[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :]
+                )
+            self.gym.apply_rigid_body_force_tensors(
+                self.sim,
+                gymtorch.unwrap_tensor(self.apply_forces),
+                gymtorch.unwrap_tensor(self.apply_torque),
+                gymapi.ENV_SPACE,
             )
-            self.apply_torque[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :] = (
-                curr_act_moving_average * (actions[:, 3:6] * self.dt * self.orientation_scale * 200)
-                + (1.0 - curr_act_moving_average)
-                * self.apply_torque[:, self.dexhand_handles[self.dexhand.to_dex("wrist")[0]], :]
-            )
-        self.gym.apply_rigid_body_force_tensors(
-            self.sim,
-            gymtorch.unwrap_tensor(self.apply_forces),
-            gymtorch.unwrap_tensor(self.apply_torque),
-            gymapi.ENV_SPACE,
-        )
 
         self.prev_targets[:] = self.curr_targets[:]
         self._pos_control[:] = self.prev_targets[:]
@@ -1069,8 +1299,10 @@ class DexHandImitatorRHEnv(VecTask):
         if self._record:
             camera_cfg = gymapi.CameraProperties()
             camera_cfg.enable_tensors = True
-            camera_cfg.width = 1280
-            camera_cfg.height = 720
+            # 640x360 keeps per-frame buffers small enough to fit a 1000+ step
+            # episode within an 8 GB cgroup. Bump only if cgroup memory allows.
+            camera_cfg.width = 640
+            camera_cfg.height = 360
             camera_cfg.horizontal_fov = 69.4
 
             camera = isaac_gym.create_camera_sensor(env, camera_cfg)

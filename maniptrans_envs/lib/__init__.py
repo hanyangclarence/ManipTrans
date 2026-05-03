@@ -20,6 +20,10 @@ TASK_MAP = {
     "DexHandImitatorManusLH": DexHandImitatorLHEnv,
     "ResDexHandManusRH": DexHandManipRHEnv,
     "ResDexHandManusLH": DexHandManipLHEnv,
+    # Arm-mounted variant (xarm_wujihand). Same env classes, but the task
+    # configs swap in the GP-style table + non-residual action layout.
+    "ResDexHandXarmManusRH": DexHandManipRHEnv,
+    "ResDexHandXarmManusLH": DexHandManipLHEnv,
 }
 
 

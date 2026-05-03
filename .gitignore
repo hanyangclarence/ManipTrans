@@ -191,3 +191,5 @@ runs
 runs/*
 
 output_trajectories_mujoco/
+# Generated visualizations from data_utils/visualize_xarm_wujihand_trajectory.py
+visualization_output_xarm/

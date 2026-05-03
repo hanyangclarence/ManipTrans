@@ -19,6 +19,13 @@ class DexHand(ABC):
         self.weight_idx = None
         self.self_collision = False
 
+        # Defaults for arm-mounted-chain support; see the docstring above.
+        # Subclasses may overwrite these in __init__ after super().__init__().
+        self.joint_state_body_names = None  # falls back to body_names below
+        self.arm_body_names = []
+        self.n_arm_dofs = 0
+        self.n_arm_bodies = 0
+
         # ? >>>>>>>>>>>
         # ? Used only in PID-controlled wrist pose mode (reference only, not our main method).
         # ? More stable in highly dynamic scenarios but requires careful tuning.
@@ -47,6 +54,18 @@ class DexHand(ABC):
     @property
     def n_bodies(self):
         return len(self.body_names)
+
+    # --- arm-mounted-chain support (default = floating-hand) --------------
+    # Subclasses representing an arm + dexhand combo (e.g. xarm_wujihand)
+    # override these in __init__ so the env can branch its scene/control
+    # logic without hard-coding hand names.
+    #
+    # joint_state_body_names: subset of body_names whose rigid_body_state
+    #   is consumed by the imitation reward / joint obs. Defaults to ALL
+    #   bodies; arm-mounted classes drop arm bodies so the reward's
+    #   `joints_state[:, 1:]` slice still spans wrist-skipped finger bodies.
+    # n_arm_dofs: arm DOFs preceding finger DOFs in dof_state. 0 = floating.
+    # n_arm_bodies: arm rigid bodies preceding the wrist (palm). 0 = floating.
 
     @property
     def urdf_path(self):

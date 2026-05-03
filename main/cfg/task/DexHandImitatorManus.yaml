@@ -42,6 +42,11 @@ env:
   actionScale: 1.0
   useQuatRot: false
 
+  # Per-step joint-target delta scale for the 7 arm DOFs when the dexhand
+  # is arm-mounted (e.g. xarm_wujihand). Ignored for floating-hand dexhands.
+  # Matches GP `_apply_xarm_rel_hand_abs_control` value.
+  baseActionScale: 0.025
+
   useFingertipsOnly: True
 
   propDumpInfo:

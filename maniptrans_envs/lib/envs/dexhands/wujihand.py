@@ -159,6 +159,25 @@ class WujiHand(DexHand, ABC):
         self.Ki_pos = 0.005
         self.Kd_pos = 0.1
 
+        # Per-DOF position-drive gains, ordered to match self.dof_names. Read by
+        # dexhandimitator / dexhandmanip_sh in place of the global 500/30 defaults
+        # because WujiHand's URDF effort limits (~0.15-0.65 N·m) are too small to
+        # tolerate the default damping; with Kd=30, finger DOFs saturate before
+        # they can move. Values calibrated for WujiHand actuator authority.
+        self.dof_kp = [
+            96.86, 96.86, 141.42, 141.42,  # finger1 (thumb) joint1..4
+            96.86, 96.86, 141.42, 141.42,  # finger2 (index)
+            96.86, 96.86, 141.42, 141.42,  # finger3 (middle)
+            96.86, 96.86, 141.42, 141.42,  # finger4 (ring)
+            96.86, 96.86, 141.42, 141.42,  # finger5 (pinky)
+        ]
+        self.dof_kd = [
+            5.18, 5.18, 7.20, 7.20,
+            5.18, 5.18, 7.20, 7.20,
+            5.18, 5.18, 7.20, 7.20,
+            5.18, 5.18, 7.20, 7.20,
+            5.18, 5.18, 7.20, 7.20,
+        ]
         # Enable self-collision checking if needed
         self.self_collision = False
 
