@@ -166,24 +166,8 @@ class ManipData(Dataset, ABC):
             data["tips_distance"] = data["tips_distance"][: self.max_seq_len]
 
     def load_retargeted_data(self, data, retargeted_data_path):
-        # If the retargeting file is for a different hand (different DOF count),
-        # treat as missing — the env still works using zero DOF init.
-        retarget_dof_mismatch = False
-        if os.path.exists(retargeted_data_path):
-            opt_params = pickle.load(open(retargeted_data_path, "rb"))
-            if opt_params["opt_dof_pos"].shape[-1] != self.dexhand.n_dofs:
-                retarget_dof_mismatch = True
-                if self.verbose:
-                    cprint(
-                        f"\nWARNING: {retargeted_data_path} has opt_dof_pos with "
-                        f"shape[-1]={opt_params['opt_dof_pos'].shape[-1]} but "
-                        f"{self.dexhand.name} expects {self.dexhand.n_dofs}; falling "
-                        f"back to zero DOF init.\n",
-                        "yellow",
-                    )
-
-        if not os.path.exists(retargeted_data_path) or retarget_dof_mismatch:
-            if self.verbose and not retarget_dof_mismatch:
+        if not os.path.exists(retargeted_data_path):
+            if self.verbose:
                 cprint(f"\nWARNING: {retargeted_data_path} does not exist.", "red")
                 cprint(f"WARNING: This may lead to a slower transfer process or even failure to converge.", "red")
                 cprint(
@@ -198,6 +182,7 @@ class ManipData(Dataset, ABC):
                 }
             )
         else:
+            opt_params = pickle.load(open(retargeted_data_path, "rb"))
             data.update(
                 {
                     "opt_wrist_pos": torch.tensor(opt_params["opt_wrist_pos"], device=self.device),

@@ -4,6 +4,7 @@ from functools import lru_cache
 
 import numpy as np
 import torch
+from termcolor import cprint
 
 from .base import ManipData
 from .decorators import register_manipdata
@@ -120,5 +121,19 @@ class ManusDexHandRH(ManipData):
         }
 
         self.process_data(data, index, obj_verts)
-        self.load_retargeted_data(data, ret_path)
+        # Manus retargeting pickles are wujihand-specific by construction
+        # (convert_manus_to_maniptrans.py writes a frame-invariant 20-DOF pose).
+        # For any other dexhand, skip the file and let load_retargeted_data hit
+        # its missing-path branch (zero DOF init + raw demo wrist).
+        if self.dexhand.name == "wujihand":
+            self.load_retargeted_data(data, ret_path)
+        else:
+            if self.verbose:
+                cprint(
+                    f"\nWARNING: manus retargeting at {ret_path} is wujihand-specific "
+                    f"(20 hardcoded DOFs); current dexhand is '{self.dexhand.name}'. "
+                    f"Falling back to zero DOF init.\n",
+                    "yellow",
+                )
+            self.load_retargeted_data(data, "")
         return data

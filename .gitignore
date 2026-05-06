@@ -124,6 +124,8 @@ debug_*
 .tabnine_root
 
 wandb/*
+wandb_*
+logs/*
 jit*.c
 jit*.so
 jit*.o
