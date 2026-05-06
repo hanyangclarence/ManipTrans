@@ -189,3 +189,7 @@ make*.py
 
 runs
 runs/*
+
+output_trajectories_mujoco/
+logs/
+wandb_*/
