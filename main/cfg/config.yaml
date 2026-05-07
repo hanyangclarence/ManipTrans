@@ -83,6 +83,13 @@ wandb_logcode_dir: ''
 capture_video: False
 n_parallel_recorders: 8
 n_successful_videos_to_record: 50
+local_video_dir: null
+
+# When set, eval runs one deterministic rollout per env starting at frame 0
+# and dumps per-trajectory progress/success stats to eval_stats_out (JSON).
+# num_envs should equal len(dataIndices) for the 1-env-per-traj convention.
+eval_progress_stats: False
+eval_stats_out: null
 display: False
 headless: True
 

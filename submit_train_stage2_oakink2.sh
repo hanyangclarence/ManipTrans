@@ -121,8 +121,9 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 export CXX=/usr/bin/g++
 export SETUPTOOLS_USE_DISTUTILS=stdlib
 
-# Per-job wandb dir prevents concurrent jobs from racing on wandb-resume.json.
-export WANDB_DIR="wandb_${SLURM_JOB_ID:-local}"
+# All jobs share ./wandb (wandb run subdirs are unique per experiment name,
+# which embeds a timestamp, so concurrent jobs don't collide).
+export WANDB_DIR="./wandb"
 mkdir -p "$WANDB_DIR"
 
 nvidia-smi -L
@@ -146,7 +147,7 @@ python main/rl/train.py \
     num_envs=4096 \
     learning_rate=2e-4 \
     test=false \
-    randomStateInit=true \
+    randomStateInit=false \
     rh_base_model_checkpoint=assets/imitator_rh_inspire.pth \
     lh_base_model_checkpoint=assets/imitator_lh_inspire.pth \
     "dataIndices=[${INDICES}]" \

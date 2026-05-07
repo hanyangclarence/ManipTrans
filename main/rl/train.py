@@ -164,6 +164,7 @@ def launch_rlg_hydra(cfg: DictConfig):
                 envs,
                 n_parallel_recorders=cfg.n_parallel_recorders,
                 n_successful_videos_to_record=cfg.n_successful_videos_to_record,
+                local_video_dir=cfg.get("local_video_dir", None),
             )
         return envs
 
@@ -242,6 +243,8 @@ def launch_rlg_hydra(cfg: DictConfig):
                 "num_rollouts_to_save": cfg.num_rollouts_to_save,
                 "num_rollouts_to_run": cfg.num_rollouts_to_run,
                 "min_episode_length": cfg.min_episode_length,
+                "eval_progress_stats": cfg.get("eval_progress_stats", False),
+                "eval_stats_out": cfg.get("eval_stats_out", None),
             },
         }
     )

@@ -87,6 +87,9 @@ class MyBasePlayer(object):
         num_rollouts_to_run: int = 1e10,
         # weird bug in states if episodes are too short
         min_episode_length: int = 25,
+        # per-trajectory eval (1 env per dataIndex; deterministic; from frame 0)
+        eval_progress_stats: bool = False,
+        eval_stats_out: Optional[str] = None,
     ):
         self.config = config = params["config"]
         self.load_networks(params)
@@ -183,6 +186,10 @@ class MyBasePlayer(object):
         self.num_rollouts_to_save = num_rollouts_to_save
         self.num_rollouts_to_run = num_rollouts_to_run
         self.min_episode_length = min_episode_length
+
+        # per-trajectory eval mode
+        self.eval_progress_stats = eval_progress_stats
+        self.eval_stats_out = eval_stats_out
 
         if save_rollouts:
             os.makedirs(os.path.dirname(rollout_saving_fpath), exist_ok=True)
@@ -362,6 +369,8 @@ class MyBasePlayer(object):
             ]
 
     def run(self):
+        if self.eval_progress_stats:
+            return self._run_eval_progress_stats()
         render = self.render_env
         is_deterministic = self.is_deterministic
         sum_rewards = 0
@@ -511,6 +520,116 @@ class MyBasePlayer(object):
                     cur_rewards_done = cur_rewards / done_count
                     cur_steps_done = cur_steps / done_count
                     print(f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}")
+
+    def _run_eval_progress_stats(self):
+        """One deterministic rollout per env, starting at frame 0
+        (assumes randomStateInit=false). Records per-env progress at
+        termination, success/failure, and the trajectory progress ratio
+        progress_at_done / seq_len. Aggregates across trajectories.
+
+        With 1 env per dataIndex (the recommended num_envs setting), each
+        env corresponds to exactly one trajectory in cfg.dataIndices. The
+        env round-robins via env_k -> dataIndices[k % len(dataIndices)],
+        so num_envs > len(dataIndices) just replays trajectories; we ignore
+        any replicas in the per-trajectory aggregation.
+        """
+        import json
+
+        raw_env = self.env
+        # unwrap wrappers (WandbVideoCaptureWrapper etc.) to reach the task
+        for _ in range(8):
+            if hasattr(raw_env, "dataIndices"):
+                break
+            inner = getattr(raw_env, "env", None)
+            if inner is None:
+                break
+            raw_env = inner
+        assert hasattr(raw_env, "dataIndices"), "could not unwrap to task env"
+
+        n_envs = raw_env.num_envs
+        data_indices = list(raw_env.dataIndices)
+        n_traj = len(data_indices)
+        # demo_data["seq_len"] is shape (num_envs,) post-pack
+        seq_lens = raw_env.demo_data["seq_len"].detach().cpu().long()
+
+        progress = torch.full((n_envs,), -1, dtype=torch.long)
+        succ = torch.zeros(n_envs, dtype=torch.bool)
+        fail = torch.zeros(n_envs, dtype=torch.bool)
+
+        obses = self.env_reset(self.env)
+        self.get_batch_size(obses, 1)
+        if self.is_rnn:
+            self.init_rnn()
+        done = None
+        # safety cap: longest trajectory is at most max_episode_length steps
+        max_steps = int(seq_lens.max().item()) + 16
+        for _ in range(max_steps):
+            if (progress >= 0).all():
+                break
+            if done is not None and torch.any(done):
+                obses, _ = self.env.reset_done()
+            actions = self.get_action(obses, is_deterministic=self.is_deterministic)
+            obses, _, done, info = self.env_step(self.env, actions)
+            done_envs = done.nonzero(as_tuple=False).flatten().cpu()
+            for env_id in done_envs.tolist():
+                if progress[env_id] >= 0:
+                    continue
+                progress[env_id] = int(info["total_steps"][env_id].item())
+                succ[env_id] = bool(raw_env.success_buf[env_id].item())
+                fail[env_id] = bool(raw_env.failure_buf[env_id].item())
+
+        # any env that never terminated (shouldn't happen given the cap)
+        unfinished = (progress < 0).sum().item()
+        if unfinished:
+            print(f"[eval] WARN: {unfinished}/{n_envs} envs never terminated within "
+                  f"{max_steps} steps; reporting them as last-seen progress.")
+            for ei in (progress < 0).nonzero(as_tuple=False).flatten().tolist():
+                progress[ei] = int(raw_env.progress_buf[ei].item())
+
+        ratio = progress.float() / seq_lens.float().clamp(min=1)
+
+        print()
+        print(f"=== Per-trajectory eval (deterministic, frame 0, {n_envs} envs / {n_traj} traj) ===")
+        print(f"{'idx':>4s}  {'data_idx':<14s} {'seq_len':>8s} {'steps':>7s} {'ratio':>7s} {'status':>8s}")
+        per_traj = []
+        for ti in range(n_traj):
+            # env i's dataIndex == dataIndices[i % n_traj]; first hit is env i==ti
+            ei = ti
+            status = "succ" if succ[ei] else ("fail" if fail[ei] else "tout")
+            print(f"{ti:>4d}  {data_indices[ti]:<14s} {seq_lens[ei].item():>8d} "
+                  f"{progress[ei].item():>7d} {ratio[ei].item():>7.3f} {status:>8s}")
+            per_traj.append({
+                "data_idx": data_indices[ti],
+                "seq_len": int(seq_lens[ei].item()),
+                "progress": int(progress[ei].item()),
+                "ratio": float(ratio[ei].item()),
+                "success": bool(succ[ei].item()),
+                "failure": bool(fail[ei].item()),
+            })
+
+        # aggregate over the first n_traj envs (one per unique trajectory)
+        head = slice(0, n_traj)
+        overall = {
+            "n_trajectories": n_traj,
+            "mean_steps": float(progress[head].float().mean().item()),
+            "mean_progress_ratio": float(ratio[head].mean().item()),
+            "success_rate": float(succ[head].float().mean().item()),
+            "failure_rate": float(fail[head].float().mean().item()),
+            "timeout_rate": float((~(succ | fail))[head].float().mean().item()),
+        }
+        print()
+        print(f"=== Overall (mean over {n_traj} trajectories) ===")
+        print(f"  mean steps:           {overall['mean_steps']:.1f}")
+        print(f"  mean progress ratio:  {overall['mean_progress_ratio']:.3f}")
+        print(f"  success rate:         {overall['success_rate']:.3f}")
+        print(f"  failure rate:         {overall['failure_rate']:.3f}")
+        print(f"  timeout rate:         {overall['timeout_rate']:.3f}")
+
+        if self.eval_stats_out:
+            os.makedirs(os.path.dirname(self.eval_stats_out) or ".", exist_ok=True)
+            with open(self.eval_stats_out, "w") as f:
+                json.dump({"per_traj": per_traj, "overall": overall}, f, indent=2)
+            print(f"\n[eval] wrote {self.eval_stats_out}")
 
     def get_batch_size(self, obses, batch_size):
         obs_shape = self.obs_shape

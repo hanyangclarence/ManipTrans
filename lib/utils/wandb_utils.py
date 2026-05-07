@@ -1,4 +1,9 @@
+import os
+from datetime import datetime
+from typing import Optional
+
 import gym
+import numpy as np
 import torch
 import wandb
 from rl_games.common.algo_observer import AlgoObserver
@@ -64,6 +69,7 @@ class WandbVideoCaptureWrapper(gym.Wrapper):
         env,
         n_parallel_recorders: int = 1,
         n_successful_videos_to_record: int = 50,
+        local_video_dir: Optional[str] = None,
     ):
         super().__init__(env)
         n_parallel_recorders = min(n_parallel_recorders, env.num_envs)
@@ -75,22 +81,41 @@ class WandbVideoCaptureWrapper(gym.Wrapper):
         self._n_video_saved = 0
         self._n_successful_video_saved = 0
         self._n_successful_videos_to_record = n_successful_videos_to_record
+        self._local_video_dir = local_video_dir
+        if self._local_video_dir is not None:
+            os.makedirs(self._local_video_dir, exist_ok=True)
 
     def reset(self, **kwargs):
         self._videos = [[] for _ in range(self._n_recorders)]
         return super().reset(**kwargs)
 
+    def _save_local(self, frames_chw_uint8: np.ndarray, status: str) -> None:
+        # frames: (T, C, H, W) uint8 -> (T, H, W, C) for ffmpeg writer
+        import imageio
+        frames = frames_chw_uint8.transpose(0, 2, 3, 1)
+        ts = datetime.now().strftime("%H%M%S")
+        path = os.path.join(
+            self._local_video_dir,
+            f"video-{self._n_video_saved:04d}_{status}_{ts}.mp4",
+        )
+        with imageio.get_writer(path, fps=10, codec="libx264", quality=8) as w:
+            for f in frames:
+                w.append_data(f)
+        print(f"[video] wrote {path}  ({frames.shape[0]} frames, {status})")
+
     def step(self, action):
         obs, reward, done, info = super().step(action)
         for i, idx in enumerate(self._rcd_idxs):
-            self._videos[i].append(self.env.camera_obs[idx].clone())
+            # Move to CPU + drop alpha immediately so long episodes don't
+            # accumulate on the GPU (a 700-frame 1280x720 RGBA buffer is
+            # ~2.5 GB and OOMs on a 16 GB card during torch.stack).
+            frame = self.env.camera_obs[idx][..., :3].to(dtype=torch.uint8).cpu()
+            self._videos[i].append(frame)
         if torch.any(done):
             for i, idx in enumerate(self._rcd_idxs):
                 if done[idx]:
-                    video = torch.stack(self._videos[i])[..., :-1]  # (T, H, W, C), RGBA -> RGB
-                    video = video.to(dtype=torch.uint8)
-                    video = video.permute(0, 3, 1, 2).detach().cpu().numpy()  # (T, C, H, W)
-                    video = wandb.Video(video, fps=10, format="mp4")
+                    video = torch.stack(self._videos[i])  # (T, H, W, 3) uint8 cpu
+                    video = video.permute(0, 3, 1, 2).numpy()  # (T, C, H, W)
                     succeeded = self.env.success_buf
                     failed = self.env.failure_buf
                     status = "timeout"
@@ -99,7 +124,13 @@ class WandbVideoCaptureWrapper(gym.Wrapper):
                         self._n_successful_video_saved += 1
                     elif failed[idx]:
                         status = "failure"
-                    wandb.log({f"test_video/video-{self._n_video_saved}_{status}": video})
+                    if self._local_video_dir is not None:
+                        self._save_local(video, status)
+                    if wandb.run is not None:
+                        wandb.log({
+                            f"test_video/video-{self._n_video_saved}_{status}":
+                                wandb.Video(video, fps=10, format="mp4")
+                        })
                     self._n_video_saved += 1
                     self._videos[i] = []
                     if self._n_successful_video_saved >= self._n_successful_videos_to_record:
