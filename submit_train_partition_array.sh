@@ -85,6 +85,21 @@ CHUNK_PADDED=$(printf '%02d' "$TASK_ID")
 ARR_ID="${SLURM_ARRAY_JOB_ID:-local$(date +%Y%m%d_%H%M%S)}"
 EXPERIMENT="oakink2_inspire_${OBJECT}_n${N_ARG}_chunk${CHUNK_PADDED}_arr${ARR_ID}"
 
+# Skip-if-already-trained: if any prior array left a "best" checkpoint at
+# runs/<expt-prefix>__*/nn/<expt-prefix>.pth, treat this chunk as done and
+# exit 0. The chunk identity is (object, n_arg, chunk_index) — the array
+# job id is allowed to differ, so re-running the same sbatch picks up only
+# the missing chunks. Set FORCE_RETRAIN=1 in the env to override.
+EXPT_PREFIX="oakink2_inspire_${OBJECT}_n${N_ARG}_chunk${CHUNK_PADDED}_arr"
+if [ -z "${FORCE_RETRAIN:-}" ]; then
+    EXISTING=$(ls runs/${EXPT_PREFIX}*/nn/${EXPT_PREFIX}*.pth 2>/dev/null | head -1 || true)
+    if [ -n "$EXISTING" ]; then
+        echo "[task $TASK_ID] chunk already trained; skipping. Found: $EXISTING"
+        echo "  (set FORCE_RETRAIN=1 to retrain anyway.)"
+        exit 0
+    fi
+fi
+
 echo "Object:      $OBJECT"
 echo "N per chunk: $N_PER  (n_arg=$N_ARG)"
 echo "Chunks:      $CHUNKS  (of $TOTAL_CHUNKS total, capped at $MAX_CHUNKS)"
@@ -106,12 +121,11 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 export CXX=/usr/bin/g++
 export SETUPTOOLS_USE_DISTUTILS=stdlib
 
-# All jobs share ./wandb. Each wandb run sits in its own
-# wandb/run-<ts>-uid_<experiment> subdir, so concurrent array tasks
-# don't collide as long as the experiment name (which embeds chunk + array
-# job id) is unique across tasks.
-export WANDB_DIR="./wandb"
-mkdir -p "$WANDB_DIR"
+# wandb is disabled for the partition sweep — too many concurrent tasks
+# race on ./wandb's auto-resume id and crash before training starts.
+# Set WANDB_MODE=disabled as a belt-and-braces in case any code path still
+# touches the wandb client even with wandb_activate=False.
+export WANDB_MODE=disabled
 
 nvidia-smi -L
 
@@ -129,7 +143,4 @@ python main/rl/train.py \
     "dataIndices=[${INDICES}]" \
     actionsMovingAverage=0.4 \
     "experiment=${EXPERIMENT}" \
-    wandb_activate=True \
-    wandb_project=maniptrans-oakink2-baseline \
-    "wandb_name=${EXPERIMENT}" \
-    "wandb_tags=[stage2,inspire,partition,${OBJECT},n${N_ARG},chunk${CHUNK_PADDED}]"
+    wandb_activate=False

@@ -23,7 +23,7 @@ OBJECT="${1:?usage: $0 <cup|spoon|stick> <n|all>}"
 N_ARG="${2:?usage: $0 <cup|spoon|stick> <n|all>}"
 
 cd ~/code/humanoid/ManipTrans
-mkdir -p results
+mkdir -p results logs/eval_outputs
 
 PATTERN="runs/oakink2_inspire_${OBJECT}_n${N_ARG}_chunk*_*/"
 RUNS=( $(ls -d ${PATTERN} 2>/dev/null) )
