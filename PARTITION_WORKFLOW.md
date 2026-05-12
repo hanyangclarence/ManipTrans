@@ -1,8 +1,10 @@
-# OakInk2 Stage-2 Partition Sweep
+# OakInk2 Stage-2 Partition Sweep (WujiHand)
 
-Train Stage-2 inspire policies on partitioned trajectory chunks of varying
-width `n`, then evaluate each policy on its own training chunk. Compares
-"separate" (small n) vs "joint" (large n) training under a fixed budget.
+Train Stage-2 wuji floating-hand policies on partitioned trajectory chunks of
+varying width `n`, then evaluate each policy on its own training chunk.
+Compares "separate" (small n) vs "joint" (large n) training under a fixed
+budget. (The inspire-baseline equivalent lives on branch
+`oakink2-baseline-original`.)
 
 ## Pre-requisites
 
@@ -10,9 +12,17 @@ width `n`, then evaluate each policy on its own training chunk. Compares
   produced by `filter_oakink2_indices.py`. Already present for cup (93),
   spoon (98), stick (13).
 - All trajectories retargeted under
-  `data/retargeting/OakInk-v2/mano2inspire_rh/` — `submit_retarget_oakink2_array.sh`
-  takes care of that. The training launcher does **not** retarget on the fly.
-- Stage-1 imitator checkpoints at `assets/imitator_{r,l}h_inspire.pth`.
+  `data/retargeting/OakInk-v2/mano2wujihand_rh/` (the user already produced
+  1,930 of these; all 204 cup/spoon/stick indices are covered).
+  `submit_retarget_oakink2_array.sh indices_<obj>.txt wujihand` re-runs any
+  that go missing.
+- **Stage-1 imitator checkpoint at `assets/imitator_rh_wujihand.pth`** —
+  produced by `submit_train_stage1_oakink2_wuji.sh`. After that job finishes,
+  copy the result into `assets/`:
+  ```
+  cp runs/imitator_oakink2_wuji_rh_all_*/nn/imitator_oakink2_wuji_rh_all_*.pth \
+     assets/imitator_rh_wujihand.pth
+  ```
 - `runs/` is a symlink to `/scratch4/.../maniptrans_runs/` (set up already).
 
 ## How partitioning works
@@ -34,7 +44,7 @@ Each policy gets a unique experiment name embedding the chunk index + array
 job id, so eval can glob all chunks of a sweep cell:
 
 ```
-oakink2_inspire_<object>_n<n>_chunk<kk>_arr<SLURM_ARRAY_JOB_ID>
+oakink2_wuji_<object>_n<n>_chunk<kk>_arr<SLURM_ARRAY_JOB_ID>
 ```
 
 ## 1. Launch training

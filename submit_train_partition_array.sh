@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=oakink2-stage2-part
-#SBATCH --output=logs/slurm_outputs/stage2-part-%A_%a.out
-#SBATCH --error=logs/slurm_outputs/stage2-part-%A_%a.err
+#SBATCH --job-name=oakink2-stage2-wuji-part
+#SBATCH --output=logs/slurm_outputs/stage2-wuji-part-%A_%a.out
+#SBATCH --error=logs/slurm_outputs/stage2-wuji-part-%A_%a.err
 #SBATCH --partition=gpu-preempt
 #SBATCH --gres=gpu:1
 #SBATCH --time=06:00:00
@@ -9,9 +9,13 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --constraint=a16
 
-# Stage-2 (residual manipulation) trained as a SLURM array, with the dataset
-# indices partitioned into fixed-size chunks. Each array task k trains one
-# policy on chunk k (lines [k*n+1 : (k+1)*n] of indices_<object>.txt).
+# Stage-2 (residual manipulation) for the wuji floating-hand baseline, trained
+# as a SLURM array with the dataset indices partitioned into fixed-size chunks.
+# Each array task k trains one policy on chunk k (lines [k*n+1 : (k+1)*n] of
+# indices_<object>.txt).
+#
+# Prerequisite: `assets/imitator_rh_wujihand.pth` exists (Stage 1 output from
+# submit_train_stage1_oakink2_wuji.sh).
 #
 # Cap: at most MAX_CHUNKS=20 policies per (object, n) — extra chunks are
 # silently dropped (matches the user's "subsample and skip" plan).
@@ -27,7 +31,7 @@
 #
 # Experiment dir name embeds n + zero-padded chunk index + the array job id,
 # so eval_partition_results.sh can glob all chunks of a submission together:
-#   oakink2_inspire_<obj>_n<N>_chunk<kk>_arr<jobid>
+#   oakink2_wuji_<obj>_n<N>_chunk<kk>_arr<jobid>
 #
 # Each policy runs for the SLURM time limit (6h) — no max_epochs / early_stop.
 
@@ -83,14 +87,14 @@ fi
 
 CHUNK_PADDED=$(printf '%02d' "$TASK_ID")
 ARR_ID="${SLURM_ARRAY_JOB_ID:-local$(date +%Y%m%d_%H%M%S)}"
-EXPERIMENT="oakink2_inspire_${OBJECT}_n${N_ARG}_chunk${CHUNK_PADDED}_arr${ARR_ID}"
+EXPERIMENT="oakink2_wuji_${OBJECT}_n${N_ARG}_chunk${CHUNK_PADDED}_arr${ARR_ID}"
 
 # Skip-if-already-trained: if any prior array left a "best" checkpoint at
 # runs/<expt-prefix>__*/nn/<expt-prefix>.pth, treat this chunk as done and
 # exit 0. The chunk identity is (object, n_arg, chunk_index) — the array
 # job id is allowed to differ, so re-running the same sbatch picks up only
 # the missing chunks. Set FORCE_RETRAIN=1 in the env to override.
-EXPT_PREFIX="oakink2_inspire_${OBJECT}_n${N_ARG}_chunk${CHUNK_PADDED}_arr"
+EXPT_PREFIX="oakink2_wuji_${OBJECT}_n${N_ARG}_chunk${CHUNK_PADDED}_arr"
 if [ -z "${FORCE_RETRAIN:-}" ]; then
     EXISTING=$(ls runs/${EXPT_PREFIX}*/nn/${EXPT_PREFIX}*.pth 2>/dev/null | head -1 || true)
     if [ -n "$EXISTING" ]; then
@@ -131,16 +135,18 @@ nvidia-smi -L
 
 python main/rl/train.py \
     task=ResDexHand \
-    dexhand=inspire \
+    dexhand=wujihand \
     side=RH \
     headless=true \
     num_envs=4096 \
     learning_rate=2e-4 \
     test=false \
     randomStateInit=false \
-    rh_base_model_checkpoint=assets/imitator_rh_inspire.pth \
-    lh_base_model_checkpoint=assets/imitator_lh_inspire.pth \
+    rh_base_model_checkpoint=assets/imitator_rh_wujihand.pth \
+    lh_base_model_checkpoint=assets/imitator_rh_wujihand.pth \
     "dataIndices=[${INDICES}]" \
     actionsMovingAverage=0.4 \
+    translationScale=2.7 \
+    orientationScale=0.4 \
     "experiment=${EXPERIMENT}" \
     wandb_activate=False

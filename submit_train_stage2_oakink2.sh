@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=oakink2-stage2
-#SBATCH --output=logs/slurm_outputs/stage2-%j.out
-#SBATCH --error=logs/slurm_outputs/stage2-%j.err
+#SBATCH --job-name=oakink2-stage2-wuji
+#SBATCH --output=logs/slurm_outputs/stage2-wuji-%j.out
+#SBATCH --error=logs/slurm_outputs/stage2-wuji-%j.err
 #SBATCH --partition=gpu-preempt
 #SBATCH --gres=gpu:1
 #SBATCH --time=48:00:00
@@ -9,10 +9,13 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --constraint=a16
 
-# Stage 2 (residual manipulation) on OakInk2 inspire trajectories. Reads the
-# per-object index file produced by filter_oakink2_indices.py and feeds the
-# first N lines into `dataIndices=[...]`. The env round-robins these across
-# `num_envs` per `dexhandimitator.py:320`/`dexhandmanip_sh.py:334`.
+# Stage 2 (residual manipulation) on OakInk2 wuji floating-hand trajectories.
+# Reads the per-object index file produced by filter_oakink2_indices.py and
+# feeds the first N lines into `dataIndices=[...]`. The env round-robins these
+# across `num_envs` per `dexhandimitator.py:320`/`dexhandmanip_sh.py:334`.
+#
+# Prerequisite: `assets/imitator_rh_wujihand.pth` must already exist (produced
+# by submit_train_stage1_oakink2_wuji.sh, then `cp`'d into assets/).
 #
 # The training has no hard cap and no plateau early-stop (root-config defaults
 # are 9999999999999 for both `max_iterations` and `early_stop_epochs`), so the
@@ -32,7 +35,7 @@
 #   sbatch submit_train_stage2_oakink2.sh cup
 #   sbatch submit_train_stage2_oakink2.sh spoon 10
 #   sbatch submit_train_stage2_oakink2.sh stick 1
-#   sbatch submit_train_stage2_oakink2.sh cup all runs/oakink2_inspire_cup_all_*/nn/oakink2_inspire_cup_all_*.pth
+#   sbatch submit_train_stage2_oakink2.sh cup all runs/oakink2_wuji_cup_all_*/nn/oakink2_wuji_cup_all_*.pth
 
 set -eo pipefail
 
@@ -84,7 +87,7 @@ fi
 INDICES=$(head -n "$N" "$INDEX_FILE" | paste -sd ,)
 
 # Sanity: confirm the matching retargeting pickle exists for each picked index.
-DUMP_DIR="data/retargeting/OakInk-v2/mano2inspire_rh"
+DUMP_DIR="data/retargeting/OakInk-v2/mano2wujihand_rh"
 MISSING=0
 while read -r IDX; do
     HASH5="${IDX%@*}"
@@ -128,7 +131,7 @@ mkdir -p "$WANDB_DIR"
 
 nvidia-smi -L
 
-EXPERIMENT="oakink2_inspire_${OBJECT}_${N_TAG}_$(date +%Y%m%d_%H%M%S)"
+EXPERIMENT="oakink2_wuji_${OBJECT}_${N_TAG}_$(date +%Y%m%d_%H%M%S)"
 echo "Run name:  ${EXPERIMENT}"
 
 CKPT_ARG=""
@@ -136,25 +139,37 @@ if [ -n "$RESUME_CKPT" ]; then
     CKPT_ARG="checkpoint=${RESUME_CKPT}"
 fi
 
+# wuji-specific knobs (vs. inspire baseline):
+#   - dexhand=wujihand selects the 20-DOF WujiHand class, which exposes
+#     dof_kp / dof_kd that the task envs pick up via getattr fallback.
+#   - rh/lh_base_model_checkpoint -> the wuji Stage-1 imitator (LH path is
+#     unused in single-hand mode, but resolved by config — same RH ckpt is
+#     safe to reuse so the path exists).
+#   - translationScale / orientationScale compensate the 2.7x linear and
+#     ~4x angular wrist-inertia disparity vs inspire (see
+#     benchmark_wrist_force.py and logs/benchmark/wrist_response_default.log).
+#
 # We deliberately omit `early_stop_epochs` and `max_iterations` so the root
 # config's 9999999999999 defaults take effect — the job runs until SLURM
-# kills it or you scancel. README pattern preserved otherwise.
+# kills it or you scancel.
 python main/rl/train.py \
     task=ResDexHand \
-    dexhand=inspire \
+    dexhand=wujihand \
     side=RH \
     headless=true \
     num_envs=4096 \
     learning_rate=2e-4 \
     test=false \
     randomStateInit=false \
-    rh_base_model_checkpoint=assets/imitator_rh_inspire.pth \
-    lh_base_model_checkpoint=assets/imitator_lh_inspire.pth \
+    rh_base_model_checkpoint=assets/imitator_rh_wujihand.pth \
+    lh_base_model_checkpoint=assets/imitator_rh_wujihand.pth \
     "dataIndices=[${INDICES}]" \
     actionsMovingAverage=0.4 \
+    translationScale=2.7 \
+    orientationScale=0.4 \
     experiment="${EXPERIMENT}" \
     ${CKPT_ARG} \
     wandb_activate=True \
     wandb_project=maniptrans-oakink2-baseline \
     wandb_name="${EXPERIMENT}" \
-    "wandb_tags=[stage2,inspire,${OBJECT},${N_TAG}]"
+    "wandb_tags=[stage2,wujihand,${OBJECT},${N_TAG}]"

@@ -3,7 +3,7 @@
 # a given (object, n) sweep cell.
 #
 # Discovers every run matching:
-#   runs/oakink2_inspire_<object>_n<n>_chunk*_*/
+#   runs/oakink2_wuji_<object>_n<n>_chunk*_*/
 # Runs eval_oakink2_stage2.sh on any that don't yet have eval_progress_stats.json,
 # then concatenates the per_traj rows from every chunk's JSON and prints a
 # single overall summary.
@@ -25,7 +25,7 @@ N_ARG="${2:?usage: $0 <cup|spoon|stick> <n|all>}"
 cd ~/code/humanoid/ManipTrans
 mkdir -p results logs/eval_outputs
 
-PATTERN="runs/oakink2_inspire_${OBJECT}_n${N_ARG}_chunk*_*/"
+PATTERN="runs/oakink2_wuji_${OBJECT}_n${N_ARG}_chunk*_*/"
 RUNS=( $(ls -d ${PATTERN} 2>/dev/null) )
 if [ "${#RUNS[@]}" -eq 0 ]; then
     echo "No runs matching ${PATTERN}." >&2
@@ -57,7 +57,7 @@ OUT="results/${OBJECT}_n${N_ARG}_aggregate.json"
 python3 - <<EOF > >(tee /tmp/agg_${OBJECT}_n${N_ARG}.txt)
 import glob, json, os, statistics
 
-pat = "runs/oakink2_inspire_${OBJECT}_n${N_ARG}_chunk*_*/eval_progress_stats.json"
+pat = "runs/oakink2_wuji_${OBJECT}_n${N_ARG}_chunk*_*/eval_progress_stats.json"
 jsons = sorted(glob.glob(pat))
 
 all_rows = []
