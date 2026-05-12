@@ -193,3 +193,4 @@ runs/*
 output_trajectories_mujoco/
 logs/
 wandb_*/
+visualization_output/

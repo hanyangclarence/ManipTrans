@@ -269,16 +269,22 @@ class DexHandManipRHEnv(VecTask):
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_POS
         asset_options.use_mesh_materials = True
         dexhand_asset = self.gym.load_asset(self.sim, *os.path.split(dexhand_asset_file), asset_options)
+        # Per-DOF gains may be overridden on the dexhand class (e.g. WujiHand)
+        # whose URDF effort limits don't tolerate the global 500/30 defaults.
+        _kp = getattr(self.dexhand, "dof_kp", None)
+        _kd = getattr(self.dexhand, "dof_kd", None)
         dexhand_dof_stiffness = torch.tensor(
-            [500] * self.dexhand.n_dofs,
+            list(_kp) if _kp is not None else [500] * self.dexhand.n_dofs,
             dtype=torch.float,
             device=self.sim_device,
         )
         dexhand_dof_damping = torch.tensor(
-            [30] * self.dexhand.n_dofs,
+            list(_kd) if _kd is not None else [30] * self.dexhand.n_dofs,
             dtype=torch.float,
             device=self.sim_device,
         )
+        assert dexhand_dof_stiffness.numel() == self.dexhand.n_dofs
+        assert dexhand_dof_damping.numel() == self.dexhand.n_dofs
         self.limit_info = {}
         asset_rh_dof_props = self.gym.get_asset_dof_properties(dexhand_asset)
         self.limit_info["rh"] = {
